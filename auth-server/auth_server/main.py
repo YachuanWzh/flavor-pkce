@@ -125,10 +125,7 @@ def login(
     ).fetchone()
     db.close()
 
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    if not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+    if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     session_token = secrets.token_urlsafe(32)
@@ -165,14 +162,6 @@ def login(
         secure=False,  # Set True in production with HTTPS
     )
     return resp
-
-
-@app.get("/login", response_class=HTMLResponse)
-def login_page(request: Request):
-    """Return a simple login page. (placeholder for React frontend)."""
-    return_url = request.query_params.get("return_url", "")
-    html = LOGIN_HTML.replace("__RETURN_URL__", return_url)
-    return HTMLResponse(content=html)
 
 
 # ---------- PKCE Authorization ----------
@@ -414,35 +403,35 @@ def _build_consent_html(client_name: str, scope: str, username: str) -> str:
     )
 
 
-# ---------- HTML Templates (Fallback) ----------
+# ---------- React SPA Serving ----------
 
-LOGIN_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login — PKCE Auth Server</title>
-    <style>
-        body {{ font-family: -apple-system, sans-serif; max-width: 400px; margin: 80px auto; padding: 20px; }}
-        h1 {{ text-align: center; color: #333; }}
-        form {{ display: flex; flex-direction: column; gap: 12px; }}
-        input {{ padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }}
-        button {{ padding: 12px; background: #4f46e5; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }}
-        button:hover {{ background: #4338ca; }}
-        .error {{ color: #dc2626; font-size: 14px; }}
-    </style>
-</head>
-<body>
-    <h1>PKCE Authorization Server</h1>
-    <form id="login-form" method="post" action="/login">
-        <input type="hidden" name="return_url" value="__RETURN_URL__">
-        <input type="text" name="username" placeholder="Username" required>
-        <input type="password" name="password" placeholder="Password" required>
-        <button type="submit">Sign In</button>
-        <div class="error" id="error"></div>
-    </form>
-</body>
-</html>"""
+import os
+from pathlib import Path as _Path
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+_FRONTEND_DIST = _Path(__file__).parent.parent.parent / "frontend" / "dist"
+
+# Mount static assets (JS, CSS, images) from frontend build
+if _FRONTEND_DIST.exists():
+    _assets = _FRONTEND_DIST / "assets"
+    if _assets.exists():
+        app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
+
+
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    """Catch-all: serve React SPA for any unmatched GET route."""
+    index = _FRONTEND_DIST / "index.html"
+    if not index.exists():
+        return HTMLResponse(
+            content="<h2 style='text-align:center;margin-top:80px;font-family:sans-serif'>"
+                    "Frontend not built.<br>Run: <code>cd frontend &amp;&amp; npm run build</code></h2>"
+        )
+    return FileResponse(str(index))
+
+
+# ---------- Consent Template (server-rendered) ----------
 
 CONSENT_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -451,34 +440,76 @@ CONSENT_HTML = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Authorize — PKCE Auth Server</title>
     <style>
-        body {{ font-family: -apple-system, sans-serif; max-width: 480px; margin: 80px auto; padding: 20px; }}
-        h1 {{ color: #333; }}
-        .card {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 24px; margin-top: 16px; }}
-        .field {{ margin-bottom: 12px; }}
-        .label {{ font-size: 12px; color: #6b7280; text-transform: uppercase; }}
-        .value {{ font-size: 14px; color: #111; word-break: break-all; }}
-        .actions {{ display: flex; gap: 12px; margin-top: 20px; }}
-        .btn-approve {{ padding: 12px 24px; background: #4f46e5; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }}
-        .btn-approve:hover {{ background: #4338ca; }}
-        .btn-deny {{ padding: 12px 24px; background: #e5e7eb; color: #374151; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }}
+        *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+        body{{
+            font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+            background:#0a0a1a;
+            color:#e8ecf4;
+            min-height:100vh;
+            padding:40px 24px
+        }}
+        body::before{{
+            content:'';
+            position:fixed;
+            inset:0;
+            z-index:-1;
+            background:
+                radial-gradient(ellipse 80% 60% at 20% 30%, rgba(99,102,241,0.13) 0%, transparent 60%),
+                radial-gradient(ellipse 70% 50% at 80% 70%, rgba(139,92,246,0.1) 0%, transparent 60%)
+        }}
+        .wrapper{{max-width:540px;margin:0 auto}}
+        h1{{font-size:24px;font-weight:700;letter-spacing:-0.4px;text-align:center;margin-bottom:28px}}
+        .card{{
+            background:rgba(22,24,38,0.82);
+            backdrop-filter:blur(28px) saturate(180%);
+            -webkit-backdrop-filter:blur(28px) saturate(180%);
+            border:1px solid rgba(255,255,255,0.07);
+            border-radius:18px;
+            padding:30px;
+            margin-bottom:24px;
+            box-shadow:0 8px 32px rgba(0,0,0,0.25)
+        }}
+        .card p{{font-size:15px;color:#cbd5e1;margin-bottom:22px;line-height:1.6}}
+        .field{{margin-bottom:16px;padding:10px 14px;background:rgba(255,255,255,0.025);border-radius:8px}}
+        .field .label{{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:#64748b;margin-bottom:5px}}
+        .field .value{{font-size:14px;color:#f1f5f9;word-break:break-all;font-family:monospace}}
+        .actions{{display:flex;gap:14px}}
+        .btn{{
+            flex:1;padding:15px;border-radius:12px;font-size:15px;font-weight:600;
+            cursor:pointer;border:none;transition:all .3s;letter-spacing:.3px
+        }}
+        .btn-approve{{
+            background:linear-gradient(135deg,#6366f1,#8b5cf6);
+            color:white;
+            box-shadow:0 4px 20px rgba(99,102,241,0.4)
+        }}
+        .btn-approve:hover{{transform:translateY(-2px);box-shadow:0 8px 32px rgba(99,102,241,0.5)}}
+        .btn-deny{{
+            background:rgba(255,255,255,0.05);
+            color:#94a3b8;
+            border:1px solid rgba(255,255,255,0.1)
+        }}
+        .btn-deny:hover{{background:rgba(255,255,255,0.1);color:#e2e8f0}}
     </style>
 </head>
 <body>
-    <h1>Authorization Request</h1>
-    <div class="card">
-        <p><strong>{client_name}</strong> is requesting access to your account.</p>
-        <div class="field">
-            <div class="label">Signed in as</div>
-            <div class="value">{username}</div>
+    <div class="wrapper">
+        <h1>Authorization Request</h1>
+        <div class="card">
+            <p><strong style="color:#e2e8f0">{client_name}</strong> is requesting access to your account.</p>
+            <div class="field">
+                <div class="label">Signed in as</div>
+                <div class="value">{username}</div>
+            </div>
+            <div class="field">
+                <div class="label">Scopes</div>
+                <div class="value">{scope}</div>
+            </div>
         </div>
-        <div class="field">
-            <div class="label">Scopes</div>
-            <div class="value">{scope}</div>
-        </div>
+        <form class="actions" method="post" action="/consent">
+            <button type="submit" class="btn btn-approve">Approve</button>
+            <button type="button" class="btn btn-deny" onclick="history.back()">Deny</button>
+        </form>
     </div>
-    <form class="actions" method="post" action="/consent">
-        <button type="submit" class="btn-approve">Approve</button>
-        <button type="button" class="btn-deny" onclick="history.back()">Deny</button>
-    </form>
 </body>
 </html>"""
