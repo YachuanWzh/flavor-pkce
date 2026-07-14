@@ -29,7 +29,7 @@ app = FastAPI(title="PKCE Authorization Server", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5174"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -110,7 +110,11 @@ def register(body: RegisterRequest):
 
 
 @app.post("/login")
-def login(username: str = Form(...), password: str = Form(...)):
+def login(
+    username: str = Form(...),
+    password: str = Form(...),
+    return_url: str = Form(""),
+):
     """Authenticate a user and return a session token."""
 
     db = get_db()
@@ -128,13 +132,26 @@ def login(username: str = Form(...), password: str = Form(...)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     session_token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=3)
 
     _sessions[session_token] = {
         "user_id": user["id"],
         "username": user["username"],
         "expires_at": expires_at.isoformat(),
     }
+
+    # If this login was triggered from the authorize flow, redirect back
+    if return_url:
+        resp = RedirectResponse(url=return_url, status_code=302)
+        resp.set_cookie(
+            key="session_token",
+            value=session_token,
+            httponly=True,
+            max_age=259200,
+            samesite="lax",
+            secure=False,  # Set True in production with HTTPS
+        )
+        return resp
 
     resp = JSONResponse(
         content={"session_token": session_token, "username": user["username"]}
@@ -143,7 +160,7 @@ def login(username: str = Form(...), password: str = Form(...)):
         key="session_token",
         value=session_token,
         httponly=True,
-        max_age=3600,
+        max_age=259200,
         samesite="lax",
         secure=False,  # Set True in production with HTTPS
     )
@@ -153,7 +170,9 @@ def login(username: str = Form(...), password: str = Form(...)):
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     """Return a simple login page. (placeholder for React frontend)."""
-    return HTMLResponse(content=LOGIN_HTML)
+    return_url = request.query_params.get("return_url", "")
+    html = LOGIN_HTML.replace("__RETURN_URL__", return_url)
+    return HTMLResponse(content=html)
 
 
 # ---------- PKCE Authorization ----------
@@ -202,7 +221,8 @@ def authorize(
     if not user:
         # Store auth params and redirect to login
         return_url = request.url.path + "?" + request.url.query
-        return RedirectResponse(url=f"/login?return_url={return_url}", status_code=302)
+        encoded_return_url = urllib.parse.quote(return_url, safe="")
+        return RedirectResponse(url=f"/login?return_url={encoded_return_url}", status_code=302)
 
     # User is authenticated — show consent page
     # Store PKCE params in session for /consent
@@ -415,6 +435,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 <body>
     <h1>PKCE Authorization Server</h1>
     <form id="login-form" method="post" action="/login">
+        <input type="hidden" name="return_url" value="__RETURN_URL__">
         <input type="text" name="username" placeholder="Username" required>
         <input type="password" name="password" placeholder="Password" required>
         <button type="submit">Sign In</button>

@@ -100,7 +100,7 @@ def test_token_exchange_success(client):
     assert "access_token" in data
     assert data["token_type"] == "Bearer"
     assert "expires_in" in data
-    assert data["expires_in"] == 3600
+    assert data["expires_in"] == 259200
 
     # Verify it's a JWT (3 parts separated by dots)
     access_token = data["access_token"]

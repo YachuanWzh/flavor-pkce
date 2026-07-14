@@ -107,7 +107,7 @@ def test_full_pkce_e2e():
     data = resp.json()
     assert "access_token" in data
     assert data["token_type"] == "Bearer"
-    assert data["expires_in"] == 3600
+    assert data["expires_in"] == 259200
 
     access_token = data["access_token"]
 

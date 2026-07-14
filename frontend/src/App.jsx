@@ -1,11 +1,12 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import LoginPage from "./LoginPage";
+import RegisterPage from "./RegisterPage";
 import ConsentPage from "./ConsentPage";
 import "./App.css";
 
 function Home() {
   return (
-    <div className="container">
+    <div className="home-wrapper">
       <h1>PKCE Authorization Server</h1>
       <p>The authorization server is running.</p>
       <p>
@@ -22,6 +23,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/register" element={<RegisterPage />} />
         <Route path="/consent" element={<ConsentPage />} />
       </Routes>
     </BrowserRouter>

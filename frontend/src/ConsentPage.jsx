@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
-const AUTH_SERVER = "http://localhost:8000";
+const AUTH_SERVER = "http://localhost:8091";
 
 export default function ConsentPage() {
   const [searchParams] = useSearchParams();
@@ -30,22 +30,22 @@ export default function ConsentPage() {
   };
 
   return (
-    <div className="container">
+    <div className="consent-wrapper">
       <h1>Authorization Request</h1>
-      <div className="card">
+      <div className="consent-card">
         <p>
           <strong>{clientName}</strong> is requesting access to your account.
         </p>
-        <div className="field">
-          <div className="label">Signed in as</div>
-          <div className="value">{username}</div>
+        <div className="consent-field">
+          <div className="consent-label">Signed in as</div>
+          <div className="consent-value">{username}</div>
         </div>
-        <div className="field">
-          <div className="label">Scopes</div>
-          <div className="value">{scope}</div>
+        <div className="consent-field">
+          <div className="consent-label">Scopes</div>
+          <div className="consent-value">{scope}</div>
         </div>
       </div>
-      <div className="actions">
+      <div className="consent-actions">
         <button className="btn-approve" onClick={handleApprove}>
           Approve
         </button>
@@ -53,7 +53,7 @@ export default function ConsentPage() {
           Deny
         </button>
       </div>
-      {error && <div className="error">{error}</div>}
+      {error && <div className="auth-message error">{error}</div>}
     </div>
   );
 }

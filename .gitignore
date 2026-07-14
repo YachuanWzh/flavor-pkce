@@ -12,6 +12,9 @@ auth-server/keys/
 auth-server/auth.db
 *.db
 
+# Env files (API keys, secrets)
+.env
+
 # IDE
 .idea/
 .vscode/

@@ -1,45 +1,50 @@
 import { useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
 const AUTH_SERVER = "http://localhost:8091";
 
-export default function LoginPage() {
+export default function RegisterPage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
   const [loading, setLoading] = useState(false);
-  const [searchParams] = useSearchParams();
-  const returnUrl = searchParams.get("return_url") || "";
+  const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
+    setSuccess("");
 
-    const formData = new URLSearchParams();
-    formData.append("username", username);
-    formData.append("password", password);
+    if (password !== confirmPassword) {
+      setError("Passwords do not match");
+      return;
+    }
+
+    if (password.length < 6) {
+      setError("Password must be at least 6 characters");
+      return;
+    }
 
     setLoading(true);
 
     try {
-      const resp = await fetch(`${AUTH_SERVER}/login`, {
+      const resp = await fetch(`${AUTH_SERVER}/register`, {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: formData,
-        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
       });
 
+      const data = await resp.json();
+
       if (!resp.ok) {
-        setError("Invalid username or password");
+        setError(data.detail || "Registration failed");
         return;
       }
 
-      // Redirect back to authorize or home
-      if (returnUrl) {
-        window.location.href = `${AUTH_SERVER}${returnUrl}`;
-      } else {
-        window.location.href = `${AUTH_SERVER}/`;
-      }
+      setSuccess("Account created! Redirecting to login...");
+      setTimeout(() => navigate("/login"), 1500);
     } catch {
       setError("Network error. Check if the auth server is running.");
     } finally {
@@ -51,9 +56,9 @@ export default function LoginPage() {
     <div className="auth-wrapper">
       <div className="auth-card">
         <div className="auth-brand">
-          <div className="brand-icon">&#x1f510;</div>
-          <h1>Welcome back</h1>
-          <p>Sign in to your PKCE auth account</p>
+          <div className="brand-icon">&#x1f512;</div>
+          <h1>Create Account</h1>
+          <p>Register a new PKCE auth server account</p>
         </div>
 
         <form className="auth-form" onSubmit={handleSubmit}>
@@ -77,7 +82,7 @@ export default function LoginPage() {
               <input
                 id="username"
                 type="text"
-                placeholder="Enter your username"
+                placeholder="Choose a username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 required
@@ -106,7 +111,7 @@ export default function LoginPage() {
               <input
                 id="password"
                 type="password"
-                placeholder="Enter your password"
+                placeholder="At least 6 characters"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
@@ -114,15 +119,44 @@ export default function LoginPage() {
             </div>
           </div>
 
+          <div className="form-group">
+            <label htmlFor="confirmPassword">Confirm Password</label>
+            <div className="input-wrapper">
+              <svg
+                className="input-icon"
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+              </svg>
+              <input
+                id="confirmPassword"
+                type="password"
+                placeholder="Re-enter your password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                required
+              />
+            </div>
+          </div>
+
           {error && <div className="auth-message error">{error}</div>}
+          {success && <div className="auth-message success">{success}</div>}
 
           <button type="submit" className="btn-primary" disabled={loading}>
-            {loading ? "Signing in..." : "Sign In"}
+            {loading ? "Creating account..." : "Create Account"}
           </button>
         </form>
 
         <div className="auth-footer">
-          Don&apos;t have an account? <Link to="/register">Create one</Link>
+          Already have an account? <Link to="/login">Sign in</Link>
         </div>
       </div>
     </div>
