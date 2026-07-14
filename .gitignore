@@ -1,4 +1,23 @@
 .flavor
 FLAVOR.md
-# superharness brainstorm mind-map session state (transient)
-.superharness/
+.superharness
+node_modules
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+*.egg
+auth-server/keys/
+auth-server/auth.db
+*.db
+
+# IDE
+.idea/
+.vscode/
+
+# Build
+frontend/dist/
+auth-server/.pytest_cache/
+api-gateway/.pytest_cache/
+.pytest_cache/
