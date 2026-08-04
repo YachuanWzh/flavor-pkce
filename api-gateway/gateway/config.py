@@ -33,6 +33,10 @@ INTERNAL_SERVICE_TOKEN = os.environ.get(
 )
 ROUTING_CACHE_TTL_SECONDS = int(os.environ.get("ROUTING_CACHE_TTL_SECONDS", "0"))
 
+# How long (seconds) to cache an auth-server revocation verdict per jti.
+# 0 disables caching (every request checks with the auth server).
+REVOCATION_CACHE_TTL_SECONDS = int(os.environ.get("REVOCATION_CACHE_TTL_SECONDS", "5"))
+
 # Gateway settings
 HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("GATEWAY_PORT", "8092"))

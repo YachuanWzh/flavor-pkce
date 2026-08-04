@@ -15,6 +15,9 @@ AUTH_CODE_EXPIRES_IN = 600  # 10 minutes
 AUTH_HOST = os.environ.get("AUTH_HOST", "0.0.0.0")
 AUTH_PORT = int(os.environ.get("AUTH_PORT", "8091"))
 
+# Refresh token lifetime (P0-3)
+REFRESH_TOKEN_EXPIRES_IN = int(os.environ.get("REFRESH_TOKEN_EXPIRES_IN", "2592000"))  # 30 days
+
 # Password strength policy (P0-9)
 PASSWORD_MIN_LENGTH = int(os.environ.get("PASSWORD_MIN_LENGTH", "8"))
 

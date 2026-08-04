@@ -26,7 +26,10 @@ from auth_server.ratelimit import (
 )
 from auth_server.llm_config import get_llm_config, save_llm_config
 import auth_server.config as server_config
-from auth_server.config import AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN, CORS_ORIGINS, FRONTEND_DIST_PATH
+from auth_server.config import (
+    AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN, REFRESH_TOKEN_EXPIRES_IN,
+    CORS_ORIGINS, FRONTEND_DIST_PATH,
+)
 from auth_server.jwt_utils import create_jwt, get_jwt_payload
 
 
@@ -680,7 +683,7 @@ def token(
     payload = get_jwt_payload(access_token)
     jti = payload["jti"] if payload else ""
 
-    # Store token in DB for revocation support
+    # Store access token in DB for revocation support
     token_id = str(uuid.uuid4())
     token_expires = datetime.now(timezone.utc) + timedelta(seconds=JWT_EXPIRES_IN)
     db.execute(
@@ -689,12 +692,26 @@ def token(
         (token_id, jti, client_id, auth_code["user_id"],
          auth_code["scope"] or "", token_expires.isoformat())
     )
+
+    # Issue a refresh token (opaque, stored as SHA-256) and record it.
+    refresh_token = secrets.token_urlsafe(48)
+    refresh_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    refresh_expires = datetime.now(timezone.utc) + timedelta(
+        seconds=REFRESH_TOKEN_EXPIRES_IN
+    )
+    db.execute(
+        """INSERT INTO tokens (id, jti, client_id, user_id, scope, expires_at, token_type)
+           VALUES (?, ?, ?, ?, ?, ?, 'refresh')""",
+        (str(uuid.uuid4()), refresh_hash, client_id, auth_code["user_id"],
+         auth_code["scope"] or "", refresh_expires.isoformat())
+    )
     db.commit()
     db.close()
 
     # Clear pending auth from session
     return JSONResponse(content={
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "Bearer",
         "expires_in": JWT_EXPIRES_IN,
         "config_version": llm_config["config_version"],
@@ -719,6 +736,200 @@ def _constant_time_compare(a: str, b: str) -> bool:
     for x, y in zip(a, b):
         result |= ord(x) ^ ord(y)
     return result == 0
+
+
+def _issue_refresh_and_access(
+    db, user_id: str, username: str, client_id: str, scope: str,
+) -> tuple[str, str]:
+    """Issue a fresh (access, refresh) token pair and record both rows.
+
+    Returns ``(access_token, refresh_token)``.
+    """
+    llm_config = get_llm_config(user_id)
+    if llm_config is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Configure your LLM service before signing in.",
+        )
+    access_token = create_jwt(
+        sub=user_id,
+        client_id=client_id,
+        scope=scope,
+        username=username,
+        config_version=llm_config["config_version"],
+    )
+    payload = get_jwt_payload(access_token)
+    jti = payload["jti"] if payload else str(uuid.uuid4())
+    access_expires = datetime.now(timezone.utc) + timedelta(seconds=JWT_EXPIRES_IN)
+    db.execute(
+        """INSERT INTO tokens (id, jti, client_id, user_id, scope, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (str(uuid.uuid4()), jti, client_id, user_id, scope, access_expires.isoformat()),
+    )
+    refresh_token = secrets.token_urlsafe(48)
+    refresh_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    refresh_expires = datetime.now(timezone.utc) + timedelta(
+        seconds=REFRESH_TOKEN_EXPIRES_IN
+    )
+    db.execute(
+        """INSERT INTO tokens (id, jti, client_id, user_id, scope, expires_at, token_type)
+           VALUES (?, ?, ?, ?, ?, ?, 'refresh')""",
+        (str(uuid.uuid4()), refresh_hash, client_id, user_id, scope,
+         refresh_expires.isoformat()),
+    )
+    return access_token, refresh_token
+
+
+@app.post("/refresh")
+def refresh(
+    request: Request,
+    grant_type: str = Form(...),
+    refresh_token: str = Form(...),
+    client_id: str = Form(...),
+):
+    """Refresh grant — rotate the refresh token and issue a new access token.
+
+    The old refresh token is consumed on every use (RFC 6749 §6).  Reuse of an
+    already-rotated refresh token is rejected.
+    """
+    ip = request.client.host if request.client else "unknown"
+    ip_key = f"token:ip:{ip}"
+    record_attempt(ip_key, window_seconds=server_config.TOKEN_RATE_WINDOW)
+    if is_rate_limited(
+        ip_key,
+        limit=server_config.TOKEN_RATE_LIMIT,
+        window_seconds=server_config.TOKEN_RATE_WINDOW,
+    ):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate_limited", "error_description": "Too many token requests"},
+        )
+
+    if grant_type != "refresh_token":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "grant_type must be refresh_token"},
+        )
+
+    refresh_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM tokens WHERE jti = ? AND token_type = 'refresh'",
+        (refresh_hash,),
+    ).fetchone()
+    if row is None:
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Invalid refresh token"},
+        )
+    if row["revoked"]:
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Refresh token revoked"},
+        )
+    if row["client_id"] != client_id:
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "client_id mismatch"},
+        )
+    expires_at = datetime.fromisoformat(row["expires_at"]).replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Refresh token expired"},
+        )
+
+    # Consume the old refresh token (rotation).
+    db.execute("UPDATE tokens SET revoked = 1 WHERE jti = ?", (refresh_hash,))
+
+    user_row = db.execute(
+        "SELECT username FROM users WHERE id = ?", (row["user_id"],)
+    ).fetchone()
+    username = user_row["username"] if user_row else row["user_id"]
+
+    try:
+        access_token, new_refresh = _issue_refresh_and_access(
+            db, row["user_id"], username, client_id, row["scope"] or "",
+        )
+    except HTTPException:
+        db.rollback()
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "llm_config_required", "error_description": "Configure your LLM service before signing in."},
+        )
+    db.commit()
+    db.close()
+
+    llm_config = get_llm_config(row["user_id"])
+    return JSONResponse(content={
+        "access_token": access_token,
+        "refresh_token": new_refresh,
+        "token_type": "Bearer",
+        "expires_in": JWT_EXPIRES_IN,
+        "config_version": llm_config["config_version"],
+        "llm_config": {
+            "provider_id": llm_config["provider_id"],
+            "service_name": llm_config["service_name"],
+            "api_type": llm_config["api_type"],
+            "base_url": server_config.PUBLIC_GATEWAY_URL,
+            "default_model": llm_config["default_model"],
+            "cheap_model": llm_config["cheap_model"],
+            "models": llm_config["models"],
+            "max_output_tokens": llm_config["max_output_tokens"],
+        },
+    })
+
+
+@app.post("/revoke")
+def revoke(
+    request: Request,
+    token: str = Form(...),
+    token_type_hint: str = Form(""),
+    client_id: str = Form(...),
+):
+    """RFC 7009 token revocation.
+
+    Accepts either an opaque refresh token or a JWT access token.  Always
+    returns 200 for invalid/unknown tokens to prevent token scanning.
+    """
+    candidates: list[str] = []
+    payload = get_jwt_payload(token)
+    jti = payload.get("jti") if payload else None
+    if token_type_hint == "refresh_token":
+        candidates.append(hashlib.sha256(token.encode()).hexdigest())
+    elif token_type_hint == "access_token":
+        if jti:
+            candidates.append(jti)
+    else:
+        if jti:
+            candidates.append(jti)
+        candidates.append(hashlib.sha256(token.encode()).hexdigest())
+
+    db = get_db()
+    for candidate in candidates:
+        db.execute("UPDATE tokens SET revoked = 1 WHERE jti = ?", (candidate,))
+    db.commit()
+    db.close()
+    return JSONResponse(content={})
+
+
+@app.get("/internal/tokens/revoked")
+def internal_tokens_revoked(request: Request, jti: str):
+    """Internal endpoint for the gateway: is this access-token jti revoked?"""
+    supplied = request.headers.get("x-internal-service-token", "")
+    if not secrets.compare_digest(supplied, server_config.INTERNAL_SERVICE_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid internal service credential")
+    db = get_db()
+    row = db.execute(
+        "SELECT revoked FROM tokens WHERE jti = ? AND token_type = 'access'", (jti,),
+    ).fetchone()
+    db.close()
+    return {"revoked": bool(row and row["revoked"])}
 
 
 def _build_consent_html(client_name: str, scope: str, username: str) -> str:

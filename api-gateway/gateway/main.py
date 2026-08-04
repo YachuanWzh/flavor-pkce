@@ -43,6 +43,44 @@ app = FastAPI(title="PKCE API Gateway")
 
 _public_key = None
 _routing_cache: dict[tuple[str, int], tuple[float, dict]] = {}
+_revoked_cache: dict[str, tuple[float, bool]] = {}
+
+
+async def _is_jti_revoked(jti: str) -> bool:
+    """Ask the auth server whether this access-token jti was revoked.
+
+    The verdict is cached for REVOCATION_CACHE_TTL_SECONDS.  If the auth
+    server is unreachable we fail *open* (the JWT signature/expiry were
+    already verified locally); revocation is a mitigation, not the primary
+    gate.
+    """
+    cached = _revoked_cache.get(jti)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+
+    url = (
+        f"{gateway.config.AUTH_SERVER_INTERNAL_URL.rstrip('/')}"
+        f"/internal/tokens/revoked"
+    )
+    revoked = False
+    try:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            response = await client.get(
+                url,
+                params={"jti": jti},
+                headers={
+                    "X-Internal-Service-Token": gateway.config.INTERNAL_SERVICE_TOKEN,
+                },
+            )
+        if response.status_code == 200:
+            revoked = bool(response.json().get("revoked"))
+    except (httpx.HTTPError, ValueError):
+        revoked = False
+
+    ttl = gateway.config.REVOCATION_CACHE_TTL_SECONDS
+    if ttl > 0:
+        _revoked_cache[jti] = (time.monotonic() + ttl, revoked)
+    return revoked
 
 # Path prefixes that the observability middleware should NOT audit-log.
 _AUDIT_SKIP_PREFIXES = ("/metrics", "/api/logs", "/health")
@@ -282,6 +320,14 @@ async def proxy(request: Request, path: str):
         return JSONResponse(
             status_code=401,
             content={"error": "Invalid or expired JWT"},
+        )
+
+    # Reject tokens whose jti was revoked at the auth server (P0-3).
+    jti = payload.get("jti")
+    if jti and await _is_jti_revoked(jti):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Token has been revoked"},
         )
 
     # Human-readable username comes from the JWT 'username' claim (added

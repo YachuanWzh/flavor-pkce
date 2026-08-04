@@ -203,6 +203,15 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_tokens_jti ON tokens(jti);
     """)
 
+    # Migrate the tokens table (idempotent): refresh-token rows need a
+    # token_type column so access and refresh rows share one table.
+    cursor.execute("PRAGMA table_info(tokens)")
+    token_cols = {row[1] for row in cursor.fetchall()}
+    if "token_type" not in token_cols:
+        cursor.execute(
+            "ALTER TABLE tokens ADD COLUMN token_type TEXT NOT NULL DEFAULT 'access'"
+        )
+
     # Add roles to databases created before administrator management existed.
     user_columns = {
         row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()
