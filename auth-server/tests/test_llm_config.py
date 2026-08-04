@@ -15,6 +15,7 @@ def isolated_db():
     os.close(fd)
     previous = config.DB_PATH
     config.DB_PATH = path
+    config.SEED_TEST_USER = True
     init_db()
     yield
     config.DB_PATH = previous

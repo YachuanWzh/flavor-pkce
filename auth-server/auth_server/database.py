@@ -227,14 +227,16 @@ def init_db() -> None:
             (json.dumps(["http://127.0.0.1:*"]), json.dumps(["http://127.0.0.1:"])),
         )
 
-    # Seed test user (only if not exists)
-    cursor.execute("SELECT COUNT(*) FROM users WHERE username = ?", ("testuser",))
-    if cursor.fetchone()[0] == 0:
-        password_hash = bcrypt.hashpw(b"testpass", bcrypt.gensalt()).decode()
-        cursor.execute(
-            "INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)",
-            (str(uuid.uuid4()), "testuser", password_hash)
-        )
+    # Seed test user only when explicitly requested (SEED_TEST_USER=true).
+    # Production must not contain a well-known default credential (P0-8).
+    if _config.SEED_TEST_USER:
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username = ?", ("testuser",))
+        if cursor.fetchone()[0] == 0:
+            password_hash = bcrypt.hashpw(b"testpass", bcrypt.gensalt()).decode()
+            cursor.execute(
+                "INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)",
+                (str(uuid.uuid4()), "testuser", password_hash)
+            )
 
     # Seed (and intentionally rotate) the configured administrator password.
     # No administrator is created when the deployment omits either value.

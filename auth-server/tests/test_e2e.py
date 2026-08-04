@@ -19,6 +19,7 @@ def setup():
     os.close(fd)
     old_db = auth_config.DB_PATH
     auth_config.DB_PATH = tmp_db
+    auth_config.SEED_TEST_USER = True
 
     from auth_server.database import init_db
     init_db()

@@ -18,6 +18,7 @@ def clean_db_and_keys():
     fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="auth_test_")
     os.close(fd)
     config.DB_PATH = tmp_path
+    config.SEED_TEST_USER = True
 
     # Clean up test keys
     keys_dir = os.path.join(os.path.dirname(__file__), "..", "auth_server", "keys")

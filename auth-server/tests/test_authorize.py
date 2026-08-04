@@ -21,6 +21,7 @@ def clean_db():
     fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="auth_test_")
     os.close(fd)
     config.DB_PATH = tmp_path
+    config.SEED_TEST_USER = True
     init_db()
     yield
     config.DB_PATH = _original_db_path

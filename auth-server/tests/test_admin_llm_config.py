@@ -15,6 +15,7 @@ def isolated_db(monkeypatch):
     os.close(fd)
     previous = config.DB_PATH
     config.DB_PATH = path
+    config.SEED_TEST_USER = True
     monkeypatch.setattr(config, "ADMIN_USERNAME", "route-admin", raising=False)
     monkeypatch.setattr(config, "ADMIN_PASSWORD", "admin-test-password", raising=False)
     init_db()

@@ -32,6 +32,34 @@ TOKEN_RATE_WINDOW = int(os.environ.get("TOKEN_RATE_WINDOW", "60"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
 ENABLE_HSTS = os.environ.get("ENABLE_HSTS", "false").lower() == "true"
 
+# Startup safety (P0-8)
+SEED_TEST_USER = os.environ.get("SEED_TEST_USER", "false").lower() == "true"
+ALLOW_INSECURE_DEFAULTS = (
+    os.environ.get("ALLOW_INSECURE_DEFAULTS", "false").lower() == "true"
+)
+
+
+def validate_production_config() -> None:
+    """Fail fast when a known-insecure default secret is still configured.
+
+    Local development can opt out explicitly with ALLOW_INSECURE_DEFAULTS=true;
+    production must never rely on that escape hatch.
+    """
+    if ALLOW_INSECURE_DEFAULTS:
+        return
+    problems = []
+    if SECRET_KEY == "dev-secret-change-in-production":
+        problems.append("AUTH_SECRET_KEY (default)")
+    if INTERNAL_SERVICE_TOKEN == "dev-internal-token-change-me":
+        problems.append("INTERNAL_SERVICE_TOKEN (default)")
+    if problems:
+        raise RuntimeError(
+            "Refusing to start with insecure default secret(s): "
+            + ", ".join(problems)
+            + ". Set strong values via environment variables, or set "
+            "ALLOW_INSECURE_DEFAULTS=true for local development only."
+        )
+
 # Public gateway metadata and private gateway-to-auth credential.
 PUBLIC_GATEWAY_URL = os.environ.get("PUBLIC_GATEWAY_URL", "http://127.0.0.1:8092")
 INTERNAL_SERVICE_TOKEN = os.environ.get("INTERNAL_SERVICE_TOKEN", "dev-internal-token-change-me")

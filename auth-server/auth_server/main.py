@@ -32,6 +32,7 @@ from auth_server.jwt_utils import create_jwt, get_jwt_payload
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    server_config.validate_production_config()  # P0-8: fail fast on weak defaults
     init_db()
     yield
 
