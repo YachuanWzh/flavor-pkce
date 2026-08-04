@@ -28,6 +28,7 @@ import gateway.config
 from gateway.database import (
     init_audit_db, query_logs, query_log_by_id, clear_logs, verify_integrity,
 )
+from gateway.ssrf import validate_upstream_url
 from gateway.logging import setup_logging, log_request
 from gateway.metrics import (
     REQUEST_COUNT,
@@ -160,6 +161,18 @@ async def _resolve_user_routing(payload: dict) -> tuple[dict | None, JSONRespons
         routing = response.json()
     except ValueError:
         return None, JSONResponse(status_code=502, content={"error": "Invalid routing response"})
+
+    # SSRF guard (P0-7): refuse to proxy to private/metadata/loopback targets,
+    # even when the user controls their own upstream_url.
+    if not validate_upstream_url(str(routing.get("upstream_url", ""))):
+        return None, JSONResponse(
+            status_code=400,
+            content={
+                "error": "upstream_url not allowed",
+                "detail": "The configured upstream URL is not a public HTTP(S) endpoint",
+            },
+        )
+
     if gateway.config.ROUTING_CACHE_TTL_SECONDS > 0:
         _routing_cache[key] = (
             time.monotonic() + gateway.config.ROUTING_CACHE_TTL_SECONDS,
@@ -380,6 +393,20 @@ async def proxy(request: Request, path: str):
     if routing_error is not None:
         return routing_error
     assert routing is not None
+
+    # SSRF defense-in-depth (P0-7): re-validate user-controlled routing at the
+    # proxy layer too, so a routing entry from any source (cache, internal API)
+    # cannot target private/metadata addresses. The legacy fallback upstream
+    # is operator-configured (UPSTREAM_URL env) and is trusted, so it is exempt.
+    if routing.get("service_name") != "legacy-upstream":
+        if not validate_upstream_url(str(routing.get("upstream_url", ""))):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "upstream_url not allowed",
+                    "detail": "The configured upstream URL is not a public HTTP(S) endpoint",
+                },
+            )
 
     # --- Build upstream request ---
     upstream_url = (
