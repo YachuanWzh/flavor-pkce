@@ -17,6 +17,96 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+# ---------------------------------------------------------------------------
+# Sessions (persisted — survives restarts, enables horizontal scaling)
+# ---------------------------------------------------------------------------
+
+def create_session(session_token: str, user_id: str, username: str, expires_at: str) -> None:
+    """Persist a login session row."""
+    db = get_db()
+    db.execute(
+        "INSERT INTO sessions (session_token, user_id, username, expires_at) VALUES (?, ?, ?, ?)",
+        (session_token, user_id, username, expires_at),
+    )
+    db.commit()
+    db.close()
+
+
+def get_session(session_token: str) -> dict | None:
+    """Return a valid session dict, or None (deleting it when expired)."""
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM sessions WHERE session_token = ?", (session_token,),
+    ).fetchone()
+    if row is None:
+        db.close()
+        return None
+    expires_at = datetime.fromisoformat(row["expires_at"])
+    if expires_at < datetime.now(timezone.utc):
+        db.execute("DELETE FROM sessions WHERE session_token = ?", (session_token,))
+        db.commit()
+        db.close()
+        return None
+    db.close()
+    return dict(row)
+
+
+def delete_session(session_token: str) -> None:
+    """Remove a session row (logout)."""
+    db = get_db()
+    db.execute("DELETE FROM sessions WHERE session_token = ?", (session_token,))
+    db.commit()
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Pending authorization (persisted with the session)
+# ---------------------------------------------------------------------------
+
+def set_pending_auth(session_token: str, data: dict) -> None:
+    """Store the pending /authorize parameters for a session (upsert)."""
+    db = get_db()
+    db.execute(
+        """INSERT INTO pending_auths
+               (session_token, client_id, redirect_uri, code_challenge, scope, state)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(session_token) DO UPDATE SET
+               client_id=excluded.client_id,
+               redirect_uri=excluded.redirect_uri,
+               code_challenge=excluded.code_challenge,
+               scope=excluded.scope,
+               state=excluded.state""",
+        (
+            session_token,
+            data["client_id"],
+            data["redirect_uri"],
+            data["code_challenge"],
+            data.get("scope", ""),
+            data["state"],
+        ),
+    )
+    db.commit()
+    db.close()
+
+
+def get_pending_auth(session_token: str) -> dict | None:
+    """Return the pending /authorize parameters for a session."""
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM pending_auths WHERE session_token = ?", (session_token,),
+    ).fetchone()
+    db.close()
+    return dict(row) if row else None
+
+
+def clear_pending_auth(session_token: str) -> None:
+    """Remove the pending /authorize parameters for a session."""
+    db = get_db()
+    db.execute("DELETE FROM pending_auths WHERE session_token = ?", (session_token,))
+    db.commit()
+    db.close()
+
+
 def init_db() -> None:
     """Initialize database schema and seed data."""
     conn = sqlite3.connect(_config.DB_PATH)
@@ -77,6 +167,24 @@ def init_db() -> None:
             config_version             INTEGER NOT NULL DEFAULT 1,
             created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at                 TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_token TEXT PRIMARY KEY,
+            user_id       TEXT NOT NULL REFERENCES users(id),
+            username      TEXT NOT NULL,
+            expires_at    TEXT NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS pending_auths (
+            session_token   TEXT PRIMARY KEY REFERENCES sessions(session_token) ON DELETE CASCADE,
+            client_id       TEXT NOT NULL,
+            redirect_uri    TEXT NOT NULL,
+            code_challenge  TEXT NOT NULL,
+            scope           TEXT,
+            state           TEXT NOT NULL,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
         CREATE INDEX IF NOT EXISTS idx_auth_codes_expires ON authorization_codes(expires_at);

@@ -26,8 +26,7 @@ def isolated_db():
 
 @pytest.fixture
 def client():
-    from auth_server.main import app, _sessions
-    _sessions.clear()
+    from auth_server.main import app
     return TestClient(app)
 
 

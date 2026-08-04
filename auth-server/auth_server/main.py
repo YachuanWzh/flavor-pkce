@@ -15,7 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 import bcrypt
 
-from auth_server.database import get_db, init_db
+from auth_server.database import (
+    get_db, init_db,
+    create_session, get_session, delete_session,
+    set_pending_auth, get_pending_auth, clear_pending_auth,
+)
 from auth_server.llm_config import get_llm_config, save_llm_config
 import auth_server.config as server_config
 from auth_server.config import AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN, CORS_ORIGINS, FRONTEND_DIST_PATH
@@ -44,8 +48,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     """Convert FastAPI validation errors to 400 (per OAuth spec)."""
     return JSONResponse(status_code=400, content={"detail": "Invalid request parameters"})
 
-# In-memory session store (for demo purposes; use Redis in production)
-_sessions: dict[str, dict] = {}
+# Sessions and pending-authorization state live in SQLite (see database.py),
+# so they survive restarts and work across multiple server processes.
 
 # ---------- Models ----------
 
@@ -85,16 +89,11 @@ class LlmConfigUpdate(BaseModel):
 # ---------- Auth Helpers ----------
 
 def get_current_user(request: Request) -> dict | None:
-    """Get the current user from session cookie."""
+    """Get the current user from the persisted session cookie."""
     session_token = request.cookies.get("session_token")
-    if not session_token or session_token not in _sessions:
+    if not session_token:
         return None
-    session = _sessions[session_token]
-    exp = datetime.fromisoformat(session["expires_at"])
-    if exp < datetime.now(timezone.utc):
-        del _sessions[session_token]
-        return None
-    return session
+    return get_session(session_token)
 
 
 def require_current_user(request: Request) -> dict:
@@ -257,14 +256,10 @@ def register(body: RegisterRequest):
     db.commit()
     db.close()
 
-    # Auto-login after registration: create session and set cookie
+    # Auto-login after registration: persist session and set cookie
     session_token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(days=3)
-    _sessions[session_token] = {
-        "user_id": user_id,
-        "username": body.username,
-        "expires_at": expires_at.isoformat(),
-    }
+    create_session(session_token, user_id, body.username, expires_at.isoformat())
 
     resp = JSONResponse(
         content={"id": user_id, "username": body.username},
@@ -303,11 +298,7 @@ def login(
     session_token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(days=3)
 
-    _sessions[session_token] = {
-        "user_id": user["id"],
-        "username": user["username"],
-        "expires_at": expires_at.isoformat(),
-    }
+    create_session(session_token, user["id"], user["username"], expires_at.isoformat())
 
     # If this login was triggered from the authorize flow, redirect back
     if return_url:
@@ -337,10 +328,6 @@ def login(
 
 
 # ---------- PKCE Authorization ----------
-
-# Store pending authorization params in server-side session memory
-_pending_auth: dict[str, dict] = {}
-
 
 @app.get("/authorize", response_class=HTMLResponse)
 def authorize(
@@ -385,16 +372,15 @@ def authorize(
         encoded_return_url = urllib.parse.quote(return_url, safe="")
         return RedirectResponse(url=f"/login?return_url={encoded_return_url}", status_code=302)
 
-    # User is authenticated — show consent page
-    # Store PKCE params in session for /consent
+    # User is authenticated — persist PKCE params for /consent
     session_token = request.cookies.get("session_token")
-    _sessions[session_token]["pending_auth"] = {
+    set_pending_auth(session_token, {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "code_challenge": code_challenge,
         "scope": scope,
         "state": state,
-    }
+    })
 
     return HTMLResponse(content=_build_consent_html(
         client_name=client["name"],
@@ -418,7 +404,7 @@ def consent_confirm(request: Request):
         raise HTTPException(status_code=401, detail="Authentication required")
 
     session_token = request.cookies.get("session_token")
-    pending = _sessions.get(session_token, {}).get("pending_auth")
+    pending = get_pending_auth(session_token)
     if not pending:
         raise HTTPException(status_code=400, detail="Missing authorization context")
 
@@ -442,6 +428,8 @@ def consent_confirm(request: Request):
     )
     db.commit()
     db.close()
+
+    clear_pending_auth(session_token)
 
     # Build redirect URL
     redirect_params = urllib.parse.urlencode({"code": code, "state": state})
