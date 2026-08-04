@@ -34,7 +34,7 @@ def test_register_new_user(client):
     """POST /register should create a new user."""
     resp = client.post("/register", json={
         "username": "alice",
-        "password": "secret123"
+        "password": "Secret123"
     })
     assert resp.status_code == 201
     data = resp.json()
@@ -48,11 +48,11 @@ def test_register_duplicate_username(client):
     """POST /register should reject duplicate usernames."""
     client.post("/register", json={
         "username": "alice",
-        "password": "secret123"
+        "password": "Secret123"
     })
     resp = client.post("/register", json={
         "username": "alice",
-        "password": "another456"
+        "password": "Another456"
     })
     assert resp.status_code == 409
 
@@ -67,11 +67,11 @@ def test_login_success(client):
     """POST /login (API) should set session cookie on success."""
     client.post("/register", json={
         "username": "charlie",
-        "password": "mypassword"
+        "password": "MyPass123"
     })
     resp = client.post("/login", data={
         "username": "charlie",
-        "password": "mypassword"
+        "password": "MyPass123"
     })
     assert resp.status_code == 200
     data = resp.json()
@@ -84,7 +84,7 @@ def test_login_wrong_password(client):
     """POST /login should reject wrong password."""
     client.post("/register", json={
         "username": "dave",
-        "password": "correct"
+        "password": "Correct1"
     })
     resp = client.post("/login", data={
         "username": "dave",
@@ -122,7 +122,7 @@ def test_register_sets_session_cookie(client):
     """POST /register should set session cookie (auto-login)."""
     resp = client.post("/register", json={
         "username": "eve",
-        "password": "secret123"
+        "password": "Secret123"
     })
     assert resp.status_code == 201
     assert "Set-Cookie" in resp.headers
@@ -133,7 +133,7 @@ def test_register_then_access_authorize(client):
     """After registration, the session cookie should allow accessing /authorize."""
     resp = client.post("/register", json={
         "username": "frank",
-        "password": "secret123"
+        "password": "Secret123"
     })
     assert resp.status_code == 201
     cookie = resp.headers["Set-Cookie"]

@@ -4,6 +4,8 @@ Provides helpers to initialise the schema, insert log entries, and query
 them with date/keyword filtering and pagination.
 """
 
+import hashlib
+import json
 import sqlite3
 from pathlib import Path
 from typing import TypedDict
@@ -12,6 +14,24 @@ import gateway.config
 
 # Maximum characters stored per body field to prevent unbounded DB growth.
 _BODY_MAX_CHARS = 50_000
+
+
+def _row_hash(
+    prev_hash: str,
+    *,
+    timestamp: str, user: str, method: str, path: str, status: int,
+    duration_ms: float, upstream_ms: float | None, level: str,
+    prompt_tokens: int | None, completion_tokens: int | None, model: str | None,
+    session_id: str | None, request_body: str | None, response_body: str | None,
+) -> str:
+    """SHA-256 of the previous hash plus this row's canonical content."""
+    payload = json.dumps(
+        [timestamp, user, method, path, status, duration_ms, upstream_ms, level,
+         prompt_tokens, completion_tokens, model, session_id,
+         request_body, response_body],
+        sort_keys=True, default=str, ensure_ascii=False,
+    )
+    return hashlib.sha256(f"{prev_hash}|{payload}".encode("utf-8")).hexdigest()
 
 
 def _truncate_body(text: str | None) -> str | None:
@@ -52,7 +72,9 @@ def init_audit_db() -> None:
             model             TEXT,
             session_id        TEXT,
             request_body      TEXT,
-            response_body     TEXT
+            response_body     TEXT,
+            prev_hash         TEXT,
+            hash              TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
         CREATE INDEX IF NOT EXISTS idx_audit_user      ON audit_logs("user");
@@ -66,6 +88,8 @@ def init_audit_db() -> None:
         ("session_id", "TEXT"),
         ("request_body", "TEXT"),
         ("response_body", "TEXT"),
+        ("prev_hash", "TEXT"),
+        ("hash", "TEXT"),
     ):
         try:
             conn.execute(f"ALTER TABLE audit_logs ADD COLUMN {col} {col_type}")
@@ -106,23 +130,66 @@ def insert_log(
     """Insert a single audit-log row.
 
     Body fields are truncated to ``_BODY_MAX_CHARS`` to prevent unbounded
-    storage growth from large LLM payloads.
+    storage growth from large LLM payloads. Each row is chained to the
+    previous row via ``prev_hash``/``hash`` (tamper-evident audit trail).
     """
     conn = _connect()
+    conn.execute("BEGIN IMMEDIATE")
+    last = conn.execute(
+        "SELECT hash FROM audit_logs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    prev_hash = last["hash"] if last and last["hash"] is not None else ""
+
+    request_body = _truncate_body(request_body)
+    response_body = _truncate_body(response_body)
+    row_hash = _row_hash(
+        prev_hash,
+        timestamp=timestamp, user=user, method=method, path=path, status=status,
+        duration_ms=duration_ms, upstream_ms=upstream_ms, level=level,
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+        model=model, session_id=session_id,
+        request_body=request_body, response_body=response_body,
+    )
+
     conn.execute(
         """INSERT INTO audit_logs
            (timestamp, "user", method, path, status, duration_ms,
             upstream_ms, level, prompt_tokens, completion_tokens, model,
-            session_id, request_body, response_body)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            session_id, request_body, response_body, prev_hash, hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (timestamp, user, method, path, status, duration_ms,
          upstream_ms, level, prompt_tokens, completion_tokens, model,
-         session_id,
-         _truncate_body(request_body),
-         _truncate_body(response_body)),
+         session_id, request_body, response_body, prev_hash, row_hash),
     )
     conn.commit()
     conn.close()
+
+
+def verify_integrity() -> bool:
+    """Re-verify the whole hash chain. False means the log was tampered with."""
+    conn = _connect()
+    try:
+        prev = ""
+        rows = conn.execute("SELECT * FROM audit_logs ORDER BY id")
+        for row in rows:
+            row_prev = row["prev_hash"] or ""
+            if row_prev != prev:
+                return False
+            expected = _row_hash(
+                prev,
+                timestamp=row["timestamp"], user=row["user"], method=row["method"],
+                path=row["path"], status=row["status"], duration_ms=row["duration_ms"],
+                upstream_ms=row["upstream_ms"], level=row["level"],
+                prompt_tokens=row["prompt_tokens"], completion_tokens=row["completion_tokens"],
+                model=row["model"], session_id=row["session_id"],
+                request_body=row["request_body"], response_body=row["response_body"],
+            )
+            if row["hash"] != expected:
+                return False
+            prev = row["hash"]
+        return True
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

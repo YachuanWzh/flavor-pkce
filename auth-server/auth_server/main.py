@@ -15,20 +15,59 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 import bcrypt
 
-from auth_server.database import get_db, init_db
+from auth_server.database import (
+    get_db, init_db,
+    create_session, get_session, delete_session,
+    set_pending_auth, get_pending_auth, clear_pending_auth,
+)
+from auth_server.ratelimit import (
+    record_attempt, is_rate_limited,
+    record_failure, is_locked, reset_failures,
+)
+from auth_server.audit import log_event, purge_old_audit_logs
 from auth_server.llm_config import get_llm_config, save_llm_config
 import auth_server.config as server_config
-from auth_server.config import AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN, CORS_ORIGINS, FRONTEND_DIST_PATH
+from auth_server.config import (
+    AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN, REFRESH_TOKEN_EXPIRES_IN,
+    CORS_ORIGINS, FRONTEND_DIST_PATH,
+)
 from auth_server.jwt_utils import create_jwt, get_jwt_payload
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    server_config.validate_production_config()  # P0-8: fail fast on weak defaults
     init_db()
+    purge_old_audit_logs()  # P0-10: enforce retention on startup
     yield
 
 
 app = FastAPI(title="PKCE Authorization Server", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Apply security headers to every response (P0-6).
+
+    X-Frame-Options: DENY protects the consent/login pages from clickjacking.
+    CSP restricts script/style sources; style 'unsafe-inline' is required by
+    the served SPA's inline styles.
+    """
+    response = await call_next(request)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self'",
+    )
+    if server_config.ENABLE_HSTS:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    return response
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,14 +83,31 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     """Convert FastAPI validation errors to 400 (per OAuth spec)."""
     return JSONResponse(status_code=400, content={"detail": "Invalid request parameters"})
 
-# In-memory session store (for demo purposes; use Redis in production)
-_sessions: dict[str, dict] = {}
+# Sessions and pending-authorization state live in SQLite (see database.py),
+# so they survive restarts and work across multiple server processes.
 
 # ---------- Models ----------
 
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=128)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, value: str) -> str:
+        import re as _re
+        from auth_server.config import PASSWORD_MIN_LENGTH
+        if len(value) < PASSWORD_MIN_LENGTH:
+            raise ValueError(
+                f"Password must be at least {PASSWORD_MIN_LENGTH} characters"
+            )
+        if not _re.search(r"[a-z]", value):
+            raise ValueError("Password must contain a lowercase letter")
+        if not _re.search(r"[A-Z]", value):
+            raise ValueError("Password must contain an uppercase letter")
+        if not _re.search(r"[0-9]", value):
+            raise ValueError("Password must contain a digit")
+        return value
 
 
 class LlmConfigUpdate(BaseModel):
@@ -85,16 +141,11 @@ class LlmConfigUpdate(BaseModel):
 # ---------- Auth Helpers ----------
 
 def get_current_user(request: Request) -> dict | None:
-    """Get the current user from session cookie."""
+    """Get the current user from the persisted session cookie."""
     session_token = request.cookies.get("session_token")
-    if not session_token or session_token not in _sessions:
+    if not session_token:
         return None
-    session = _sessions[session_token]
-    exp = datetime.fromisoformat(session["expires_at"])
-    if exp < datetime.now(timezone.utc):
-        del _sessions[session_token]
-        return None
-    return session
+    return get_session(session_token)
 
 
 def require_current_user(request: Request) -> dict:
@@ -218,11 +269,44 @@ def internal_llm_config(
 
 
 def validate_redirect_uri(client_redirect_uris: str, redirect_uri: str) -> bool:
-    """Check if redirect_uri matches any registered URI prefix."""
+    """Check if redirect_uri exactly matches a registered URI (RFC 6749 3.1.2).
+
+    Two registration forms are supported:
+    - Exact URI: ``"http://app.example.com/cb"`` matches only itself.
+    - Port wildcard: ``"http://127.0.0.1:*"`` matches any port on that exact
+      host (used for native-app callbacks on random loopback ports).
+
+    Prefix matching is intentionally gone: a value that merely *starts with* a
+    registered string (e.g. ``http://127.0.0.1:9999.evil.com/callback``) is
+    rejected, closing a parser-differential open-redirect vector.
+    """
     import json
+    from urllib.parse import urlsplit
+
     uris = json.loads(client_redirect_uris)
+    try:
+        parsed = urlsplit(redirect_uri)
+    except ValueError:
+        return False
     for registered in uris:
-        if redirect_uri.startswith(registered):
+        if registered.endswith(":*"):
+            try:
+                reg_parsed = urlsplit(registered[:-2])
+            except ValueError:
+                continue
+            if (
+                parsed.scheme == reg_parsed.scheme
+                and parsed.hostname == reg_parsed.hostname
+            ):
+                try:
+                    port = parsed.port
+                except ValueError:
+                    # e.g. "http://127.0.0.1:9999.evil.com/callback" — the
+                    # netloc contains a non-numeric "port". Reject.
+                    continue
+                if port is not None:
+                    return True
+        elif redirect_uri == registered:
             return True
     return False
 
@@ -235,8 +319,21 @@ def generate_auth_code() -> str:
 # ---------- Routes ----------
 
 @app.post("/register", status_code=201)
-def register(body: RegisterRequest):
+def register(body: RegisterRequest, request: Request):
     """Register a new user."""
+    ip = request.client.host if request.client else "unknown"
+    ip_key = f"register:ip:{ip}"
+    record_attempt(ip_key, window_seconds=server_config.REGISTER_RATE_WINDOW)
+    if is_rate_limited(
+        ip_key,
+        limit=server_config.REGISTER_RATE_LIMIT,
+        window_seconds=server_config.REGISTER_RATE_WINDOW,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many registration attempts from this address",
+        )
+
     db = get_db()
     cursor = db.cursor()
 
@@ -257,14 +354,10 @@ def register(body: RegisterRequest):
     db.commit()
     db.close()
 
-    # Auto-login after registration: create session and set cookie
+    # Auto-login after registration: persist session and set cookie
     session_token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(days=3)
-    _sessions[session_token] = {
-        "user_id": user_id,
-        "username": body.username,
-        "expires_at": expires_at.isoformat(),
-    }
+    create_session(session_token, user_id, body.username, expires_at.isoformat())
 
     resp = JSONResponse(
         content={"id": user_id, "username": body.username},
@@ -276,18 +369,42 @@ def register(body: RegisterRequest):
         httponly=True,
         max_age=259200,
         samesite="lax",
-        secure=False,  # Set True in production with HTTPS
+        secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
     )
+    log_event(request, "register", actor_user_id=user_id, actor_username=body.username)
     return resp
 
 
 @app.post("/login")
 def login(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...),
     return_url: str = Form(""),
 ):
     """Authenticate a user and return a session token."""
+    ip = request.client.host if request.client else "unknown"
+
+    # IP-level rate limit
+    ip_key = f"login:ip:{ip}"
+    record_attempt(ip_key, window_seconds=server_config.LOGIN_RATE_WINDOW)
+    if is_rate_limited(
+        ip_key,
+        limit=server_config.LOGIN_RATE_LIMIT,
+        window_seconds=server_config.LOGIN_RATE_WINDOW,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts from this address",
+        )
+
+    # Account-level lockout after repeated failures
+    acct_key = f"login:user:{username}"
+    if is_locked(acct_key):
+        raise HTTPException(
+            status_code=429,
+            detail="Account temporarily locked due to repeated failed attempts",
+        )
 
     db = get_db()
     cursor = db.cursor()
@@ -298,16 +415,26 @@ def login(
     db.close()
 
     if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+        record_failure(
+            acct_key,
+            max_failures=server_config.LOGIN_MAX_FAILURES,
+            lock_seconds=server_config.LOGIN_LOCK_SECONDS,
+        )
+        log_event(
+            request, "login.failed",
+            actor_user_id=user["id"] if user else None,
+            actor_username=username,
+            detail={"reason": "invalid_credentials"},
+        )
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    reset_failures(acct_key)
+    log_event(request, "login.success", actor_user_id=user["id"], actor_username=user["username"])
 
     session_token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(days=3)
 
-    _sessions[session_token] = {
-        "user_id": user["id"],
-        "username": user["username"],
-        "expires_at": expires_at.isoformat(),
-    }
+    create_session(session_token, user["id"], user["username"], expires_at.isoformat())
 
     # If this login was triggered from the authorize flow, redirect back
     if return_url:
@@ -318,7 +445,7 @@ def login(
             httponly=True,
             max_age=259200,
             samesite="lax",
-            secure=False,  # Set True in production with HTTPS
+            secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
         )
         return resp
 
@@ -331,16 +458,12 @@ def login(
         httponly=True,
         max_age=259200,
         samesite="lax",
-        secure=False,  # Set True in production with HTTPS
+        secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
     )
     return resp
 
 
 # ---------- PKCE Authorization ----------
-
-# Store pending authorization params in server-side session memory
-_pending_auth: dict[str, dict] = {}
-
 
 @app.get("/authorize", response_class=HTMLResponse)
 def authorize(
@@ -385,16 +508,15 @@ def authorize(
         encoded_return_url = urllib.parse.quote(return_url, safe="")
         return RedirectResponse(url=f"/login?return_url={encoded_return_url}", status_code=302)
 
-    # User is authenticated — show consent page
-    # Store PKCE params in session for /consent
+    # User is authenticated — persist PKCE params for /consent
     session_token = request.cookies.get("session_token")
-    _sessions[session_token]["pending_auth"] = {
+    set_pending_auth(session_token, {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "code_challenge": code_challenge,
         "scope": scope,
         "state": state,
-    }
+    })
 
     return HTMLResponse(content=_build_consent_html(
         client_name=client["name"],
@@ -418,7 +540,7 @@ def consent_confirm(request: Request):
         raise HTTPException(status_code=401, detail="Authentication required")
 
     session_token = request.cookies.get("session_token")
-    pending = _sessions.get(session_token, {}).get("pending_auth")
+    pending = get_pending_auth(session_token)
     if not pending:
         raise HTTPException(status_code=400, detail="Missing authorization context")
 
@@ -443,6 +565,8 @@ def consent_confirm(request: Request):
     db.commit()
     db.close()
 
+    clear_pending_auth(session_token)
+
     # Build redirect URL
     redirect_params = urllib.parse.urlencode({"code": code, "state": state})
     redirect_url = f"{redirect_uri}?{redirect_params}"
@@ -452,6 +576,7 @@ def consent_confirm(request: Request):
 
 @app.post("/token")
 def token(
+    request: Request,
     grant_type: str = Form(...),
     code: str = Form(...),
     redirect_uri: str = Form(...),
@@ -459,6 +584,19 @@ def token(
     code_verifier: str = Form(...),
 ):
     """PKCE /token endpoint — validate code_verifier and issue JWT."""
+    ip = request.client.host if request.client else "unknown"
+    ip_key = f"token:ip:{ip}"
+    record_attempt(ip_key, window_seconds=server_config.TOKEN_RATE_WINDOW)
+    if is_rate_limited(
+        ip_key,
+        limit=server_config.TOKEN_RATE_LIMIT,
+        window_seconds=server_config.TOKEN_RATE_WINDOW,
+    ):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate_limited", "error_description": "Too many token requests"},
+        )
+
     if grant_type != "authorization_code":
         return JSONResponse(
             status_code=400,
@@ -555,7 +693,7 @@ def token(
     payload = get_jwt_payload(access_token)
     jti = payload["jti"] if payload else ""
 
-    # Store token in DB for revocation support
+    # Store access token in DB for revocation support
     token_id = str(uuid.uuid4())
     token_expires = datetime.now(timezone.utc) + timedelta(seconds=JWT_EXPIRES_IN)
     db.execute(
@@ -564,12 +702,33 @@ def token(
         (token_id, jti, client_id, auth_code["user_id"],
          auth_code["scope"] or "", token_expires.isoformat())
     )
+
+    # Issue a refresh token (opaque, stored as SHA-256) and record it.
+    refresh_token = secrets.token_urlsafe(48)
+    refresh_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    refresh_expires = datetime.now(timezone.utc) + timedelta(
+        seconds=REFRESH_TOKEN_EXPIRES_IN
+    )
+    db.execute(
+        """INSERT INTO tokens (id, jti, client_id, user_id, scope, expires_at, token_type)
+           VALUES (?, ?, ?, ?, ?, ?, 'refresh')""",
+        (str(uuid.uuid4()), refresh_hash, client_id, auth_code["user_id"],
+         auth_code["scope"] or "", refresh_expires.isoformat())
+    )
     db.commit()
     db.close()
+
+    log_event(
+        request, "token.exchange",
+        actor_user_id=auth_code["user_id"],
+        actor_username=username,
+        detail={"client_id": client_id, "grant_type": "authorization_code"},
+    )
 
     # Clear pending auth from session
     return JSONResponse(content={
         "access_token": access_token,
+        "refresh_token": refresh_token,
         "token_type": "Bearer",
         "expires_in": JWT_EXPIRES_IN,
         "config_version": llm_config["config_version"],
@@ -594,6 +753,211 @@ def _constant_time_compare(a: str, b: str) -> bool:
     for x, y in zip(a, b):
         result |= ord(x) ^ ord(y)
     return result == 0
+
+
+def _issue_refresh_and_access(
+    db, user_id: str, username: str, client_id: str, scope: str,
+) -> tuple[str, str]:
+    """Issue a fresh (access, refresh) token pair and record both rows.
+
+    Returns ``(access_token, refresh_token)``.
+    """
+    llm_config = get_llm_config(user_id)
+    if llm_config is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Configure your LLM service before signing in.",
+        )
+    access_token = create_jwt(
+        sub=user_id,
+        client_id=client_id,
+        scope=scope,
+        username=username,
+        config_version=llm_config["config_version"],
+    )
+    payload = get_jwt_payload(access_token)
+    jti = payload["jti"] if payload else str(uuid.uuid4())
+    access_expires = datetime.now(timezone.utc) + timedelta(seconds=JWT_EXPIRES_IN)
+    db.execute(
+        """INSERT INTO tokens (id, jti, client_id, user_id, scope, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (str(uuid.uuid4()), jti, client_id, user_id, scope, access_expires.isoformat()),
+    )
+    refresh_token = secrets.token_urlsafe(48)
+    refresh_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    refresh_expires = datetime.now(timezone.utc) + timedelta(
+        seconds=REFRESH_TOKEN_EXPIRES_IN
+    )
+    db.execute(
+        """INSERT INTO tokens (id, jti, client_id, user_id, scope, expires_at, token_type)
+           VALUES (?, ?, ?, ?, ?, ?, 'refresh')""",
+        (str(uuid.uuid4()), refresh_hash, client_id, user_id, scope,
+         refresh_expires.isoformat()),
+    )
+    return access_token, refresh_token
+
+
+@app.post("/refresh")
+def refresh(
+    request: Request,
+    grant_type: str = Form(...),
+    refresh_token: str = Form(...),
+    client_id: str = Form(...),
+):
+    """Refresh grant — rotate the refresh token and issue a new access token.
+
+    The old refresh token is consumed on every use (RFC 6749 §6).  Reuse of an
+    already-rotated refresh token is rejected.
+    """
+    ip = request.client.host if request.client else "unknown"
+    ip_key = f"token:ip:{ip}"
+    record_attempt(ip_key, window_seconds=server_config.TOKEN_RATE_WINDOW)
+    if is_rate_limited(
+        ip_key,
+        limit=server_config.TOKEN_RATE_LIMIT,
+        window_seconds=server_config.TOKEN_RATE_WINDOW,
+    ):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate_limited", "error_description": "Too many token requests"},
+        )
+
+    if grant_type != "refresh_token":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "grant_type must be refresh_token"},
+        )
+
+    refresh_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM tokens WHERE jti = ? AND token_type = 'refresh'",
+        (refresh_hash,),
+    ).fetchone()
+    if row is None:
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Invalid refresh token"},
+        )
+    if row["revoked"]:
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Refresh token revoked"},
+        )
+    if row["client_id"] != client_id:
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "client_id mismatch"},
+        )
+    expires_at = datetime.fromisoformat(row["expires_at"]).replace(tzinfo=timezone.utc)
+    if expires_at < datetime.now(timezone.utc):
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_grant", "error_description": "Refresh token expired"},
+        )
+
+    # Consume the old refresh token (rotation).
+    db.execute("UPDATE tokens SET revoked = 1 WHERE jti = ?", (refresh_hash,))
+
+    user_row = db.execute(
+        "SELECT username FROM users WHERE id = ?", (row["user_id"],)
+    ).fetchone()
+    username = user_row["username"] if user_row else row["user_id"]
+
+    try:
+        access_token, new_refresh = _issue_refresh_and_access(
+            db, row["user_id"], username, client_id, row["scope"] or "",
+        )
+    except HTTPException:
+        db.rollback()
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={"error": "llm_config_required", "error_description": "Configure your LLM service before signing in."},
+        )
+    db.commit()
+    db.close()
+
+    log_event(
+        request, "refresh",
+        actor_user_id=row["user_id"],
+        actor_username=username,
+        detail={"client_id": client_id},
+    )
+
+    llm_config = get_llm_config(row["user_id"])
+    return JSONResponse(content={
+        "access_token": access_token,
+        "refresh_token": new_refresh,
+        "token_type": "Bearer",
+        "expires_in": JWT_EXPIRES_IN,
+        "config_version": llm_config["config_version"],
+        "llm_config": {
+            "provider_id": llm_config["provider_id"],
+            "service_name": llm_config["service_name"],
+            "api_type": llm_config["api_type"],
+            "base_url": server_config.PUBLIC_GATEWAY_URL,
+            "default_model": llm_config["default_model"],
+            "cheap_model": llm_config["cheap_model"],
+            "models": llm_config["models"],
+            "max_output_tokens": llm_config["max_output_tokens"],
+        },
+    })
+
+
+@app.post("/revoke")
+def revoke(
+    request: Request,
+    token: str = Form(...),
+    token_type_hint: str = Form(""),
+    client_id: str = Form(...),
+):
+    """RFC 7009 token revocation.
+
+    Accepts either an opaque refresh token or a JWT access token.  Always
+    returns 200 for invalid/unknown tokens to prevent token scanning.
+    """
+    candidates: list[str] = []
+    payload = get_jwt_payload(token)
+    jti = payload.get("jti") if payload else None
+    if token_type_hint == "refresh_token":
+        candidates.append(hashlib.sha256(token.encode()).hexdigest())
+    elif token_type_hint == "access_token":
+        if jti:
+            candidates.append(jti)
+    else:
+        if jti:
+            candidates.append(jti)
+        candidates.append(hashlib.sha256(token.encode()).hexdigest())
+
+    db = get_db()
+    for candidate in candidates:
+        db.execute("UPDATE tokens SET revoked = 1 WHERE jti = ?", (candidate,))
+    db.commit()
+    db.close()
+    log_event(
+        request, "revoke",
+        detail={"client_id": client_id, "token_type_hint": token_type_hint},
+    )
+    return JSONResponse(content={})
+
+
+@app.get("/internal/tokens/revoked")
+def internal_tokens_revoked(request: Request, jti: str):
+    """Internal endpoint for the gateway: is this access-token jti revoked?"""
+    supplied = request.headers.get("x-internal-service-token", "")
+    if not secrets.compare_digest(supplied, server_config.INTERNAL_SERVICE_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid internal service credential")
+    db = get_db()
+    row = db.execute(
+        "SELECT revoked FROM tokens WHERE jti = ? AND token_type = 'access'", (jti,),
+    ).fetchone()
+    db.close()
+    return {"revoked": bool(row and row["revoked"])}
 
 
 def _build_consent_html(client_name: str, scope: str, username: str) -> str:

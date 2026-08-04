@@ -12,10 +12,11 @@ tokens arrive too late for synchronous capture.
 """
 
 import json as _json
+import secrets
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 import httpx
 import jwt as pyjwt
@@ -24,7 +25,10 @@ from cryptography.hazmat.backends import default_backend
 from prometheus_client import generate_latest, REGISTRY
 
 import gateway.config
-from gateway.database import init_audit_db, query_logs, query_log_by_id, clear_logs
+from gateway.database import (
+    init_audit_db, query_logs, query_log_by_id, clear_logs, verify_integrity,
+)
+from gateway.ssrf import validate_upstream_url
 from gateway.logging import setup_logging, log_request
 from gateway.metrics import (
     REQUEST_COUNT,
@@ -43,6 +47,44 @@ app = FastAPI(title="PKCE API Gateway")
 
 _public_key = None
 _routing_cache: dict[tuple[str, int], tuple[float, dict]] = {}
+_revoked_cache: dict[str, tuple[float, bool]] = {}
+
+
+async def _is_jti_revoked(jti: str) -> bool:
+    """Ask the auth server whether this access-token jti was revoked.
+
+    The verdict is cached for REVOCATION_CACHE_TTL_SECONDS.  If the auth
+    server is unreachable we fail *open* (the JWT signature/expiry were
+    already verified locally); revocation is a mitigation, not the primary
+    gate.
+    """
+    cached = _revoked_cache.get(jti)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+
+    url = (
+        f"{gateway.config.AUTH_SERVER_INTERNAL_URL.rstrip('/')}"
+        f"/internal/tokens/revoked"
+    )
+    revoked = False
+    try:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+            response = await client.get(
+                url,
+                params={"jti": jti},
+                headers={
+                    "X-Internal-Service-Token": gateway.config.INTERNAL_SERVICE_TOKEN,
+                },
+            )
+        if response.status_code == 200:
+            revoked = bool(response.json().get("revoked"))
+    except (httpx.HTTPError, ValueError):
+        revoked = False
+
+    ttl = gateway.config.REVOCATION_CACHE_TTL_SECONDS
+    if ttl > 0:
+        _revoked_cache[jti] = (time.monotonic() + ttl, revoked)
+    return revoked
 
 # Path prefixes that the observability middleware should NOT audit-log.
 _AUDIT_SKIP_PREFIXES = ("/metrics", "/api/logs", "/health")
@@ -119,6 +161,18 @@ async def _resolve_user_routing(payload: dict) -> tuple[dict | None, JSONRespons
         routing = response.json()
     except ValueError:
         return None, JSONResponse(status_code=502, content={"error": "Invalid routing response"})
+
+    # SSRF guard (P0-7): refuse to proxy to private/metadata/loopback targets,
+    # even when the user controls their own upstream_url.
+    if not validate_upstream_url(str(routing.get("upstream_url", ""))):
+        return None, JSONResponse(
+            status_code=400,
+            content={
+                "error": "upstream_url not allowed",
+                "detail": "The configured upstream URL is not a public HTTP(S) endpoint",
+            },
+        )
+
     if gateway.config.ROUTING_CACHE_TTL_SECONDS > 0:
         _routing_cache[key] = (
             time.monotonic() + gateway.config.ROUTING_CACHE_TTL_SECONDS,
@@ -148,8 +202,29 @@ def metrics():
 # Audit-log API
 # ---------------------------------------------------------------------------
 
+def _require_audit_token(request: Request) -> None:
+    """Gate the audit data API behind a shared secret (P0-1).
+
+    When no token is configured, the API refuses access entirely
+    (fail-closed for audit data).
+    """
+    configured = gateway.config.AUDIT_API_TOKEN
+    if not configured:
+        raise HTTPException(
+            status_code=401,
+            detail="Audit API is not enabled (set AUDIT_API_TOKEN)",
+        )
+    supplied = request.headers.get("x-audit-token", "")
+    if not secrets.compare_digest(supplied, configured):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid audit token",
+        )
+
+
 @app.get("/api/logs")
 def api_logs(
+    request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     start_date: str | None = Query(None),
@@ -158,6 +233,7 @@ def api_logs(
     user: str | None = Query(None),
 ):
     """Paginated audit-log query with optional filters."""
+    _require_audit_token(request)
     return query_logs({
         "page": page,
         "page_size": page_size,
@@ -168,9 +244,17 @@ def api_logs(
     })
 
 
+@app.get("/api/logs/integrity")
+def api_logs_integrity(request: Request):
+    """Report whether the hash chain verifies (tamper detection)."""
+    _require_audit_token(request)
+    return {"valid": verify_integrity()}
+
+
 @app.get("/api/logs/{log_id}")
-def api_log_detail(log_id: int):
+def api_log_detail(request: Request, log_id: int):
     """Return a single audit-log entry including request/response bodies."""
+    _require_audit_token(request)
     row = query_log_by_id(log_id)
     if row is None:
         return JSONResponse(status_code=404, content={"error": "Log not found"})
@@ -178,8 +262,9 @@ def api_log_detail(log_id: int):
 
 
 @app.delete("/api/logs")
-def api_clear_logs():
+def api_clear_logs(request: Request):
     """Clear all audit log entries."""
+    _require_audit_token(request)
     count = clear_logs()
     return {"deleted": count}
 
@@ -284,6 +369,14 @@ async def proxy(request: Request, path: str):
             content={"error": "Invalid or expired JWT"},
         )
 
+    # Reject tokens whose jti was revoked at the auth server (P0-3).
+    jti = payload.get("jti")
+    if jti and await _is_jti_revoked(jti):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Token has been revoked"},
+        )
+
     # Human-readable username comes from the JWT 'username' claim (added
     # by the auth server).  Older tokens only have 'sub' (a UUID).
     request.state.user_sub = payload.get("username") or payload.get("sub", "-")
@@ -300,6 +393,20 @@ async def proxy(request: Request, path: str):
     if routing_error is not None:
         return routing_error
     assert routing is not None
+
+    # SSRF defense-in-depth (P0-7): re-validate user-controlled routing at the
+    # proxy layer too, so a routing entry from any source (cache, internal API)
+    # cannot target private/metadata addresses. The legacy fallback upstream
+    # is operator-configured (UPSTREAM_URL env) and is trusted, so it is exempt.
+    if routing.get("service_name") != "legacy-upstream":
+        if not validate_upstream_url(str(routing.get("upstream_url", ""))):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "upstream_url not allowed",
+                    "detail": "The configured upstream URL is not a public HTTP(S) endpoint",
+                },
+            )
 
     # --- Build upstream request ---
     upstream_url = (

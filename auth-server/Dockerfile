@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir \
 
 COPY auth-server/auth_server/ ./auth_server/
 COPY --from=frontend-builder /frontend/dist/ ./frontend/dist/
+COPY scripts/backup.py ./scripts/backup.py
 
 RUN mkdir -p /app/keys /app/data
 

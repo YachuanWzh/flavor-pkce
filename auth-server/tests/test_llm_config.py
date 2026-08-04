@@ -15,6 +15,7 @@ def isolated_db():
     os.close(fd)
     previous = config.DB_PATH
     config.DB_PATH = path
+    config.SEED_TEST_USER = True
     init_db()
     yield
     config.DB_PATH = previous
@@ -26,8 +27,7 @@ def isolated_db():
 
 @pytest.fixture
 def client():
-    from auth_server.main import app, _sessions
-    _sessions.clear()
+    from auth_server.main import app
     return TestClient(app)
 
 
@@ -92,7 +92,7 @@ def test_configs_are_isolated_by_user(client):
     login(client)
     client.put("/api/me/llm-config", json=sample_config(service_name="Test User LLM"))
 
-    client.post("/register", json={"username": "alice", "password": "alice-pass"})
+    client.post("/register", json={"username": "alice", "password": "AlicePass1"})
     client.put("/api/me/llm-config", json=sample_config(
         provider_id="qwen", service_name="Alice LLM",
         default_model="qwen3-coder", cheap_model="qwen3-coder-fast",

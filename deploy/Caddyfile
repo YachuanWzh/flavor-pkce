@@ -1,0 +1,26 @@
+# Caddy 反向代理：自动 HTTPS（Let's Encrypt）+ TLS 终结。
+# PUBLIC_DOMAIN 由 docker-compose 注入。审计 API 不暴露公网。
+
+{$PUBLIC_DOMAIN:https://auth.example.com} {
+    # auth-server（SPA + OAuth 端点）
+    reverse_proxy auth-server:8091
+    encode gzip
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+    }
+}
+
+{$PUBLIC_GATEWAY_DOMAIN:https://gw.example.com} {
+    # api-gateway（/v1/*、/health、/metrics）
+    reverse_proxy api-gateway:8092
+    encode gzip
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+    }
+}

@@ -1,0 +1,111 @@
+# 生产部署 compose（P0-12）
+# 用法：
+#   1. cp deploy/.env.prod.example .env.prod  并填写强随机值
+#   2. docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod up -d --build
+#
+# 拓扑：Caddy(443) -> auth-server(8091) / api-gateway(8092)，内部网络隔离，
+# 服务端口不直接暴露公网。所有数据与密钥持久化在命名卷。
+
+name: flavor-pkce-prod
+
+services:
+  caddy:
+    image: caddy:2.9-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:?set PUBLIC_DOMAIN, e.g. auth.example.com}
+    depends_on:
+      auth-server:
+        condition: service_healthy
+      api-gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  auth-server:
+    build:
+      context: ..
+      dockerfile: auth-server/Dockerfile
+    expose:
+      - "8091"
+    volumes:
+      - keys-volume:/app/keys
+      - auth-db-volume:/app/data
+    environment:
+      - AUTH_HOST=0.0.0.0
+      - AUTH_PORT=8091
+      - AUTH_DB_PATH=/app/data/auth.db
+      - JWT_PRIVATE_KEY_PATH=/app/keys/private.pem
+      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
+      - LLM_CONFIG_ENCRYPTION_KEY_PATH=/app/keys/llm-config.key
+      - FRONTEND_DIST_PATH=/app/frontend/dist
+      - AUTH_SECRET_KEY=${AUTH_SECRET_KEY:?set a strong AUTH_SECRET_KEY}
+      - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN:?set a strong INTERNAL_SERVICE_TOKEN}
+      - ALLOW_INSECURE_DEFAULTS=false
+      - COOKIE_SECURE=true
+      - ENABLE_HSTS=true
+      - SEED_TEST_USER=false
+      - AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS:-180}
+      - REFRESH_TOKEN_EXPIRES_IN=${REFRESH_TOKEN_EXPIRES_IN:-2592000}
+      - CORS_ORIGINS=${PUBLIC_AUTH_ORIGIN:?set PUBLIC_AUTH_ORIGIN, e.g. https://auth.example.com}
+      - PUBLIC_GATEWAY_URL=${PUBLIC_GATEWAY_URL:?set PUBLIC_GATEWAY_URL, e.g. https://gw.example.com}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - DEFAULT_LLM_PROVIDER_ID=${DEFAULT_LLM_PROVIDER_ID:-deepseek}
+      - DEFAULT_LLM_SERVICE_NAME=${DEFAULT_LLM_SERVICE_NAME:-DeepSeek}
+      - DEFAULT_LLM_API_TYPE=${DEFAULT_LLM_API_TYPE:-anthropic}
+      - DEFAULT_LLM_MODEL=${DEFAULT_LLM_MODEL:-deepseek-v4-pro}
+      - DEFAULT_LLM_CHEAP_MODEL=${DEFAULT_LLM_CHEAP_MODEL:-deepseek-v4-flash}
+      - DEFAULT_LLM_MAX_OUTPUT_TOKENS=${DEFAULT_LLM_MAX_OUTPUT_TOKENS:-65536}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/login')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  api-gateway:
+    build:
+      context: ..
+      dockerfile: api-gateway/Dockerfile
+    expose:
+      - "8092"
+    volumes:
+      - keys-volume:/app/keys:ro
+      - audit-db-volume:/app/data
+    environment:
+      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
+      - UPSTREAM_URL=${UPSTREAM_URL:?set UPSTREAM_URL (default LLM upstream)}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:?set UPSTREAM_API_KEY}
+      - UPSTREAM_AUTH_TYPE=${UPSTREAM_AUTH_TYPE:-x-api-key}
+      - AUTH_SERVER_INTERNAL_URL=http://auth-server:8091
+      - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN:?set a strong INTERNAL_SERVICE_TOKEN}
+      - AUDIT_API_TOKEN=${AUDIT_API_TOKEN:?set AUDIT_API_TOKEN for the audit API}
+      - REVOCATION_CACHE_TTL_SECONDS=${REVOCATION_CACHE_TTL_SECONDS:-5}
+      - ROUTING_CACHE_TTL_SECONDS=${ROUTING_CACHE_TTL_SECONDS:-0}
+      - GATEWAY_HOST=0.0.0.0
+      - GATEWAY_PORT=8092
+      - AUDIT_DB_PATH=/app/data/audit.db
+    depends_on:
+      auth-server:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8092/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  keys-volume:
+  auth-db-volume:
+  audit-db-volume:
+  caddy-data:
+  caddy-config:

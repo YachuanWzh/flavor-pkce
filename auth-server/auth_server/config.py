@@ -15,6 +15,57 @@ AUTH_CODE_EXPIRES_IN = 600  # 10 minutes
 AUTH_HOST = os.environ.get("AUTH_HOST", "0.0.0.0")
 AUTH_PORT = int(os.environ.get("AUTH_PORT", "8091"))
 
+# Refresh token lifetime (P0-3)
+REFRESH_TOKEN_EXPIRES_IN = int(os.environ.get("REFRESH_TOKEN_EXPIRES_IN", "2592000"))  # 30 days
+
+# Password strength policy (P0-9)
+PASSWORD_MIN_LENGTH = int(os.environ.get("PASSWORD_MIN_LENGTH", "8"))
+
+# Rate limiting / brute-force protection (P0-4)
+LOGIN_RATE_LIMIT = int(os.environ.get("LOGIN_RATE_LIMIT", "20"))       # per IP
+LOGIN_RATE_WINDOW = int(os.environ.get("LOGIN_RATE_WINDOW", "60"))     # seconds
+LOGIN_MAX_FAILURES = int(os.environ.get("LOGIN_MAX_FAILURES", "5"))    # per account
+LOGIN_LOCK_SECONDS = int(os.environ.get("LOGIN_LOCK_SECONDS", "300"))  # lockout
+REGISTER_RATE_LIMIT = int(os.environ.get("REGISTER_RATE_LIMIT", "10"))
+REGISTER_RATE_WINDOW = int(os.environ.get("REGISTER_RATE_WINDOW", "60"))
+TOKEN_RATE_LIMIT = int(os.environ.get("TOKEN_RATE_LIMIT", "60"))
+TOKEN_RATE_WINDOW = int(os.environ.get("TOKEN_RATE_WINDOW", "60"))
+
+# Security headers / cookie hardening (P0-6). Production sets both to true.
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
+ENABLE_HSTS = os.environ.get("ENABLE_HSTS", "false").lower() == "true"
+
+# Audit retention (P0-10): how many days to keep auth audit events.
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "180"))
+
+# Startup safety (P0-8)
+SEED_TEST_USER = os.environ.get("SEED_TEST_USER", "false").lower() == "true"
+ALLOW_INSECURE_DEFAULTS = (
+    os.environ.get("ALLOW_INSECURE_DEFAULTS", "false").lower() == "true"
+)
+
+
+def validate_production_config() -> None:
+    """Fail fast when a known-insecure default secret is still configured.
+
+    Local development can opt out explicitly with ALLOW_INSECURE_DEFAULTS=true;
+    production must never rely on that escape hatch.
+    """
+    if ALLOW_INSECURE_DEFAULTS:
+        return
+    problems = []
+    if SECRET_KEY == "dev-secret-change-in-production":
+        problems.append("AUTH_SECRET_KEY (default)")
+    if INTERNAL_SERVICE_TOKEN == "dev-internal-token-change-me":
+        problems.append("INTERNAL_SERVICE_TOKEN (default)")
+    if problems:
+        raise RuntimeError(
+            "Refusing to start with insecure default secret(s): "
+            + ", ".join(problems)
+            + ". Set strong values via environment variables, or set "
+            "ALLOW_INSECURE_DEFAULTS=true for local development only."
+        )
+
 # Public gateway metadata and private gateway-to-auth credential.
 PUBLIC_GATEWAY_URL = os.environ.get("PUBLIC_GATEWAY_URL", "http://127.0.0.1:8092")
 INTERNAL_SERVICE_TOKEN = os.environ.get("INTERNAL_SERVICE_TOKEN", "dev-internal-token-change-me")
