@@ -1,5 +1,6 @@
 """Test PKCE /authorize endpoint."""
 import os
+import json
 import tempfile
 import hashlib
 import base64
@@ -144,3 +145,52 @@ def test_consent_without_authorize_fails(client):
     session = login_and_get_session(client)
     resp = client.post("/consent", cookies={"session_token": session})
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# redirect_uri exact matching (P0-5)
+# ---------------------------------------------------------------------------
+
+def test_redirect_uri_rejects_host_suffix_attack(client):
+    """A redirect_uri that only *prefix-matches* the registered value must be
+    rejected.
+
+    The old prefix-match (`startswith("http://127.0.0.1:")`) accepted
+    'http://127.0.0.1:9999.evil.com/callback' because it starts with the
+    registered string — a parser-differential open-redirect vector.
+    """
+    params, _, _ = make_pkce_params()
+    params["redirect_uri"] = "http://127.0.0.1:9999.evil.com/callback"
+    session = login_and_get_session(client)
+    resp = client.get("/authorize", params=params, cookies={"session_token": session})
+    assert resp.status_code == 400
+
+
+def test_redirect_uri_rejects_wrong_scheme(client):
+    """https variant of the registered host must be rejected (scheme must match)."""
+    params, _, _ = make_pkce_params()
+    params["redirect_uri"] = "https://127.0.0.1:9999/callback"
+    session = login_and_get_session(client)
+    resp = client.get("/authorize", params=params, cookies={"session_token": session})
+    assert resp.status_code == 400
+
+
+def test_redirect_uri_accepts_registered_host_any_port(client):
+    """The seeded CLI client registers 'http://127.0.0.1:*' — any port on the
+    loopback host must be accepted (native-app callback with random port)."""
+    params, _, _ = make_pkce_params()
+    params["redirect_uri"] = "http://127.0.0.1:45678/callback"
+    session = login_and_get_session(client)
+    resp = client.get("/authorize", params=params, cookies={"session_token": session})
+    assert resp.status_code == 200
+
+
+def test_validate_redirect_uri_exact_match():
+    """Exact registered URIs match only themselves — no prefix leakage."""
+    from auth_server.main import validate_redirect_uri
+
+    registered = json.dumps(["http://app.example.com/cb"])
+    assert validate_redirect_uri(registered, "http://app.example.com/cb") is True
+    assert validate_redirect_uri(registered, "http://app.example.com/cb/extra") is False
+    assert validate_redirect_uri(registered, "http://app.example.com/cbx") is False
+    assert validate_redirect_uri(registered, "http://evil.example.com/cb") is False

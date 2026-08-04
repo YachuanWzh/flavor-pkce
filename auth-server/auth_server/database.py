@@ -198,13 +198,21 @@ def init_db() -> None:
     if "role" not in user_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
 
-    # Seed default client (only if not exists)
+    # Seed default client (only if not exists). The redirect_uri registration
+    # uses a port wildcard ("http://127.0.0.1:*") which the exact matcher
+    # interprets as "any port on this loopback host".
     cursor.execute("SELECT COUNT(*) FROM clients WHERE id = ?", ("flavor-code-cli",))
     if cursor.fetchone()[0] == 0:
         cursor.execute(
             "INSERT INTO clients (id, name, redirect_uris) VALUES (?, ?, ?)",
             ("flavor-code-cli", "flavor-code CLI",
-             json.dumps(["http://127.0.0.1:"]))
+             json.dumps(["http://127.0.0.1:*"]))
+        )
+    else:
+        # Migrate databases seeded with the old prefix value.
+        cursor.execute(
+            "UPDATE clients SET redirect_uris = ? WHERE id = 'flavor-code-cli' AND redirect_uris = ?",
+            (json.dumps(["http://127.0.0.1:*"]), json.dumps(["http://127.0.0.1:"])),
         )
 
     # Seed test user (only if not exists)

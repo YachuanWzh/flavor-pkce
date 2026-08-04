@@ -217,11 +217,44 @@ def internal_llm_config(
 
 
 def validate_redirect_uri(client_redirect_uris: str, redirect_uri: str) -> bool:
-    """Check if redirect_uri matches any registered URI prefix."""
+    """Check if redirect_uri exactly matches a registered URI (RFC 6749 3.1.2).
+
+    Two registration forms are supported:
+    - Exact URI: ``"http://app.example.com/cb"`` matches only itself.
+    - Port wildcard: ``"http://127.0.0.1:*"`` matches any port on that exact
+      host (used for native-app callbacks on random loopback ports).
+
+    Prefix matching is intentionally gone: a value that merely *starts with* a
+    registered string (e.g. ``http://127.0.0.1:9999.evil.com/callback``) is
+    rejected, closing a parser-differential open-redirect vector.
+    """
     import json
+    from urllib.parse import urlsplit
+
     uris = json.loads(client_redirect_uris)
+    try:
+        parsed = urlsplit(redirect_uri)
+    except ValueError:
+        return False
     for registered in uris:
-        if redirect_uri.startswith(registered):
+        if registered.endswith(":*"):
+            try:
+                reg_parsed = urlsplit(registered[:-2])
+            except ValueError:
+                continue
+            if (
+                parsed.scheme == reg_parsed.scheme
+                and parsed.hostname == reg_parsed.hostname
+            ):
+                try:
+                    port = parsed.port
+                except ValueError:
+                    # e.g. "http://127.0.0.1:9999.evil.com/callback" — the
+                    # netloc contains a non-numeric "port". Reject.
+                    continue
+                if port is not None:
+                    return True
+        elif redirect_uri == registered:
             return True
     return False
 
