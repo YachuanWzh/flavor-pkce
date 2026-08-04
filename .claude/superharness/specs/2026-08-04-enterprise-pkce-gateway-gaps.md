@@ -1,7 +1,7 @@
 # flavor-pkce 企业级 PKCE+网关基座差距分析
 
 - **日期**: 2026-08-04
-- **状态**: approved（用户已确认）
+- **状态**: approved（用户已确认）；**P0 已全部实施完成（2026-08-04，分支 superharness/p0-enterprise-hardening）**
 - **来源**: superharness brainstorm 会话（脑图快照 rev 7）
 
 ## 1. 背景与约束（已确认的决策）
@@ -76,7 +76,8 @@
 - **R2**：单机 SQLite 是明确扩展上限 → 演进路线中迁 Postgres（P2-6）
 - **R3**：JWT 3 天有效期 + 无撤销 = 泄露窗口大 → P0-3 优先落地短期 token + refresh 轮换
 
-## 7. 下一步
+## 7. 实施状态
 
-- 用 `/superharness:go <目标>` 按 TDD 逐个实施 P0 项
-- P0 完成后更新本文档状态；完整企业版演进项见仓库根目录 `todo.md`
+- **P0（12 项）：全部完成 ✅**（2026-08-04，全量测试 auth 104 + gateway 99 + scripts 3 = 206 通过）
+- **P1/P2**：待排期，完整企业版演进项见仓库根目录 `todo.md`
+- 实施详情见 `plans/2026-08-04-p0-enterprise-hardening.md`

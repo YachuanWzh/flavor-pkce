@@ -55,10 +55,13 @@ def log_event(
 def purge_old_audit_logs() -> int:
     """Delete audit rows older than AUDIT_RETENTION_DAYS. Returns rows deleted."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=server_config.AUDIT_RETENTION_DAYS)
+    # Match the format used by SQLite's datetime('now') in created_at default,
+    # so the string comparison stays consistent across row formats.
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     db = get_db()
     cur = db.execute(
         "DELETE FROM audit_logs WHERE created_at < ?",
-        (cutoff.isoformat(),),
+        (cutoff_str,),
     )
     db.commit()
     deleted = cur.rowcount
