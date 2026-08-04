@@ -97,6 +97,45 @@ def test_valid_jwt_passes_verification(client):
     os.unlink(tmp_pub.name)
 
 
+def test_valid_jwt_via_x_api_key(client):
+    """Requests with valid JWT in x-api-key header should pass."""
+    import time
+    import jwt as pyjwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization as ser
+    import gateway.main as gm
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = private_key.public_key()
+
+    public_pem = public_key.public_bytes(
+        encoding=ser.Encoding.PEM,
+        format=ser.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    tmp_pub = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
+    tmp_pub.write(public_pem)
+    tmp_pub.close()
+
+    old_key_path = config.JWT_PUBLIC_KEY_PATH
+    config.JWT_PUBLIC_KEY_PATH = tmp_pub.name
+    gm._public_key = None
+
+    now = int(time.time())
+    payload = {"sub": "test", "client_id": "test", "scope": "test",
+               "iat": now, "exp": now + 3600, "jti": "test-jti"}
+    token = pyjwt.encode(payload, private_key, algorithm="RS256")
+
+    resp = client.get("/v1/models", headers={
+        "x-api-key": token
+    })
+    assert resp.status_code != 401
+
+    config.JWT_PUBLIC_KEY_PATH = old_key_path
+    gm._public_key = None
+    os.unlink(tmp_pub.name)
+
+
 def test_expired_jwt(client):
     """Expired JWT should be rejected."""
     import time
@@ -141,3 +180,24 @@ def test_expired_jwt(client):
     config.JWT_PUBLIC_KEY_PATH = old_key_path
     gm._public_key = None
     os.unlink(tmp_key.name)
+
+
+@pytest.mark.parametrize(("auth_type", "expected"), [
+    ("x-api-key", {"x-api-key": "real-secret"}),
+    ("bearer", {"authorization": "Bearer real-secret"}),
+    ("api-key", {"api-key": "real-secret"}),
+])
+def test_upstream_auth_header_modes(auth_type, expected):
+    from gateway.main import _apply_upstream_auth
+    headers = {"authorization": "Bearer client-jwt", "x-api-key": "client-jwt"}
+    _apply_upstream_auth(headers, "real-secret", auth_type)
+    for key, value in expected.items():
+        assert headers[key] == value
+    assert "client-jwt" not in str(headers)
+
+
+def test_model_allow_list():
+    from gateway.main import _is_model_allowed
+    routing = {"models": ["deepseek-v4-pro", "deepseek-v4-flash"]}
+    assert _is_model_allowed(b'{"model":"deepseek-v4-pro"}', routing) is True
+    assert _is_model_allowed(b'{"model":"other-model"}', routing) is False

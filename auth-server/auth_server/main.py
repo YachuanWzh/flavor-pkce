@@ -4,6 +4,7 @@ import secrets
 import hashlib
 import base64
 import urllib.parse
+from typing import Literal
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 
@@ -11,11 +12,13 @@ from fastapi import FastAPI, HTTPException, Request, Form
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 import bcrypt
 
 from auth_server.database import get_db, init_db
-from auth_server.config import AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN
+from auth_server.llm_config import get_llm_config, save_llm_config
+import auth_server.config as server_config
+from auth_server.config import AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN, CORS_ORIGINS, FRONTEND_DIST_PATH
 from auth_server.jwt_utils import create_jwt, get_jwt_payload
 
 
@@ -29,7 +32,7 @@ app = FastAPI(title="PKCE Authorization Server", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5174"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,6 +54,34 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
+class LlmConfigUpdate(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    service_name: str = Field(min_length=1, max_length=128)
+    api_type: Literal["openai", "anthropic"]
+    upstream_url: HttpUrl
+    upstream_api_key: str | None = Field(default=None, max_length=16384)
+    clear_api_key: bool = False
+    upstream_auth_type: Literal["x-api-key", "bearer", "api-key"]
+    default_model: str = Field(min_length=1, max_length=256)
+    cheap_model: str = Field(min_length=1, max_length=256)
+    models: list[str] = Field(min_length=1, max_length=100)
+    max_output_tokens: int = Field(gt=0, le=1_000_000)
+
+    @field_validator("models")
+    @classmethod
+    def validate_models(cls, models: list[str]) -> list[str]:
+        cleaned = [model.strip() for model in models]
+        if any(not model or len(model) > 256 for model in cleaned):
+            raise ValueError("models must contain non-empty names up to 256 characters")
+        return list(dict.fromkeys(cleaned))
+
+    @model_validator(mode="after")
+    def validate_selected_models(self):
+        if self.default_model not in self.models or self.cheap_model not in self.models:
+            raise ValueError("default_model and cheap_model must be included in models")
+        return self
+
+
 # ---------- Auth Helpers ----------
 
 def get_current_user(request: Request) -> dict | None:
@@ -64,6 +95,126 @@ def get_current_user(request: Request) -> dict | None:
         del _sessions[session_token]
         return None
     return session
+
+
+def require_current_user(request: Request) -> dict:
+    user = get_current_user(request)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+def require_admin(request: Request) -> dict:
+    user = require_current_user(request)
+    db = get_db()
+    current = db.execute(
+        "SELECT id, username, role FROM users WHERE id = ?", (user["user_id"],),
+    ).fetchone()
+    db.close()
+    if current is None or current["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return dict(current)
+
+
+def public_llm_config(value: dict) -> dict:
+    return {
+        key: item for key, item in value.items()
+        if key not in {"user_id", "upstream_api_key"}
+    }
+
+
+@app.get("/api/me")
+def api_me(request: Request):
+    user = require_current_user(request)
+    db = get_db()
+    current = db.execute(
+        "SELECT role FROM users WHERE id = ?", (user["user_id"],),
+    ).fetchone()
+    db.close()
+    if current is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return {
+        "id": user["user_id"],
+        "username": user["username"],
+        "role": current["role"],
+    }
+
+
+@app.get("/api/me/llm-config")
+def api_get_llm_config(request: Request):
+    user = require_current_user(request)
+    value = get_llm_config(user["user_id"])
+    if value is None:
+        return JSONResponse(status_code=404, content={"detail": "LLM configuration not found"})
+    return public_llm_config(value)
+
+
+@app.put("/api/me/llm-config")
+def api_put_llm_config(request: Request, body: LlmConfigUpdate):
+    user = require_current_user(request)
+    values = body.model_dump()
+    values["upstream_url"] = str(body.upstream_url).rstrip("/")
+    saved = save_llm_config(user["user_id"], values)
+    return public_llm_config(saved)
+
+
+@app.get("/api/admin/users")
+def api_admin_users(request: Request):
+    require_admin(request)
+    db = get_db()
+    users = db.execute(
+        "SELECT id, username, role, created_at FROM users ORDER BY lower(username), id",
+    ).fetchall()
+    db.close()
+    return {
+        "users": [
+            {
+                "id": user["id"],
+                "username": user["username"],
+                "role": user["role"],
+                "created_at": user["created_at"],
+                "llm_config": (
+                    public_llm_config(value)
+                    if (value := get_llm_config(user["id"])) is not None
+                    else None
+                ),
+            }
+            for user in users
+        ],
+    }
+
+
+@app.put("/api/admin/users/{user_id}/llm-config")
+def api_admin_put_llm_config(user_id: str, request: Request, body: LlmConfigUpdate):
+    require_admin(request)
+    db = get_db()
+    target = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    db.close()
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    values = body.model_dump()
+    values["upstream_url"] = str(body.upstream_url).rstrip("/")
+    return public_llm_config(save_llm_config(user_id, values))
+
+
+@app.get("/internal/users/{user_id}/llm-config")
+def internal_llm_config(
+    user_id: str,
+    request: Request,
+    version: int,
+):
+    supplied = request.headers.get("x-internal-service-token", "")
+    if not secrets.compare_digest(supplied, server_config.INTERNAL_SERVICE_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid internal service credential")
+    value = get_llm_config(user_id, include_secret=True)
+    if value is None:
+        raise HTTPException(status_code=404, detail="LLM configuration not found")
+    if value["config_version"] != version:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "configuration_changed", "config_version": value["config_version"]},
+        )
+    return value
 
 
 def validate_redirect_uri(client_redirect_uris: str, redirect_uri: str) -> bool:
@@ -106,7 +257,28 @@ def register(body: RegisterRequest):
     db.commit()
     db.close()
 
-    return {"id": user_id, "username": body.username}
+    # Auto-login after registration: create session and set cookie
+    session_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=3)
+    _sessions[session_token] = {
+        "user_id": user_id,
+        "username": body.username,
+        "expires_at": expires_at.isoformat(),
+    }
+
+    resp = JSONResponse(
+        content={"id": user_id, "username": body.username},
+        status_code=201,
+    )
+    resp.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        max_age=259200,
+        samesite="lax",
+        secure=False,  # Set True in production with HTTPS
+    )
+    return resp
 
 
 @app.post("/login")
@@ -350,14 +522,33 @@ def token(
             content={"error": "invalid_grant", "error_description": "code_verifier mismatch"}
         )
 
+    llm_config = get_llm_config(auth_code["user_id"])
+    if llm_config is None:
+        db.close()
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "llm_config_required",
+                "error_description": "Configure your LLM service before signing in.",
+            },
+        )
+
     # Mark code as used
     db.execute("UPDATE authorization_codes SET used = 1 WHERE code = ?", (code,))
+
+    # Resolve username for the JWT (so the gateway can log it)
+    user_row = db.execute(
+        "SELECT username FROM users WHERE id = ?", (auth_code["user_id"],)
+    ).fetchone()
+    username = user_row["username"] if user_row else auth_code["user_id"]
 
     # Create JWT
     access_token = create_jwt(
         sub=auth_code["user_id"],
         client_id=client_id,
         scope=auth_code["scope"] or "",
+        username=username,
+        config_version=llm_config["config_version"],
     )
 
     # Decode JWT to get jti for token tracking
@@ -381,6 +572,17 @@ def token(
         "access_token": access_token,
         "token_type": "Bearer",
         "expires_in": JWT_EXPIRES_IN,
+        "config_version": llm_config["config_version"],
+        "llm_config": {
+            "provider_id": llm_config["provider_id"],
+            "service_name": llm_config["service_name"],
+            "api_type": llm_config["api_type"],
+            "base_url": server_config.PUBLIC_GATEWAY_URL,
+            "default_model": llm_config["default_model"],
+            "cheap_model": llm_config["cheap_model"],
+            "models": llm_config["models"],
+            "max_output_tokens": llm_config["max_output_tokens"],
+        },
     })
 
 
@@ -410,7 +612,7 @@ from pathlib import Path as _Path
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-_FRONTEND_DIST = _Path(__file__).parent.parent.parent / "frontend" / "dist"
+_FRONTEND_DIST = _Path(FRONTEND_DIST_PATH)
 
 # Mount static assets (JS, CSS, images) from frontend build
 if _FRONTEND_DIST.exists():

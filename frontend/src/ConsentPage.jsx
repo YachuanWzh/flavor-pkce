@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
-const AUTH_SERVER = "http://localhost:8091";
+const AUTH_SERVER = "";
 
 export default function ConsentPage() {
   const [searchParams] = useSearchParams();

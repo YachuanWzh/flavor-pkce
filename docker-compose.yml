@@ -1,0 +1,74 @@
+services:
+  auth-server:
+    build:
+      context: .
+      dockerfile: auth-server/Dockerfile
+    ports:
+      - "8091:8091"
+    volumes:
+      - keys-volume:/app/keys
+      - auth-db-volume:/app/data
+    environment:
+      - AUTH_HOST=0.0.0.0
+      - AUTH_PORT=8091
+      - AUTH_DB_PATH=/app/data/auth.db
+      - JWT_PRIVATE_KEY_PATH=/app/keys/private.pem
+      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
+      - FRONTEND_DIST_PATH=/app/frontend/dist
+      - CORS_ORIGINS=http://192.168.5.7:8091,http://localhost:5174,http://localhost:8091
+      - PUBLIC_GATEWAY_URL=${PUBLIC_GATEWAY_URL:-http://127.0.0.1:8092}
+      - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN:-dev-internal-token-change-me}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - LLM_CONFIG_ENCRYPTION_KEY_PATH=/app/keys/llm-config.key
+      - UPSTREAM_URL=${UPSTREAM_URL}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY}
+      - UPSTREAM_AUTH_TYPE=${UPSTREAM_AUTH_TYPE:-x-api-key}
+      - DEFAULT_LLM_PROVIDER_ID=${DEFAULT_LLM_PROVIDER_ID:-deepseek}
+      - DEFAULT_LLM_SERVICE_NAME=${DEFAULT_LLM_SERVICE_NAME:-DeepSeek}
+      - DEFAULT_LLM_API_TYPE=${DEFAULT_LLM_API_TYPE:-anthropic}
+      - DEFAULT_LLM_MODEL=${DEFAULT_LLM_MODEL:-deepseek-v4-pro}
+      - DEFAULT_LLM_CHEAP_MODEL=${DEFAULT_LLM_CHEAP_MODEL:-deepseek-v4-flash}
+      - DEFAULT_LLM_MAX_OUTPUT_TOKENS=${DEFAULT_LLM_MAX_OUTPUT_TOKENS:-65536}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    ports:
+      - "8092:8092"
+    volumes:
+      - keys-volume:/app/keys:ro
+      - audit-db-volume:/app/data
+    environment:
+      - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
+      - UPSTREAM_URL=${UPSTREAM_URL}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY}
+      - UPSTREAM_AUTH_TYPE=${UPSTREAM_AUTH_TYPE:-x-api-key}
+      - AUTH_SERVER_INTERNAL_URL=http://auth-server:8091
+      - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN:-dev-internal-token-change-me}
+      - GATEWAY_HOST=0.0.0.0
+      - GATEWAY_PORT=8092
+      - AUDIT_DB_PATH=/app/data/audit.db
+    depends_on:
+      auth-server:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8092/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  keys-volume:
+  auth-db-volume:
+  audit-db-volume:

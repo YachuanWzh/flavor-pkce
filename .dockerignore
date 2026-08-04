@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+*.egg
+.pytest_cache/
+.venv/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+
+# Env files (secrets stay out of images)
+.env
+api-gateway/.env
+
+# SQLite databases
+*.db
+
+# Keys (generated at runtime via volume)
+auth-server/keys/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude/Flavor
+.claude/
+.flavor/
+FLAVOR.md
+PKCE.md

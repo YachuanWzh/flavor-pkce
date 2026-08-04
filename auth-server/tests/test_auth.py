@@ -1,23 +1,26 @@
 """Test user registration and login."""
 import os
+import tempfile
 import pytest
 from fastapi.testclient import TestClient
 
-from auth_server.database import init_db, DB_PATH
+from auth_server.database import init_db
 import auth_server.config as config
+
+_original_db_path = config.DB_PATH
 
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    """Remove test database before each test."""
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    # Override test DB path
-    config.DB_PATH = DB_PATH
+    """Use a temporary database for each test."""
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="auth_test_")
+    os.close(fd)
+    config.DB_PATH = tmp_path
     init_db()
     yield
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    config.DB_PATH = _original_db_path
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
 
 
 @pytest.fixture
@@ -113,3 +116,37 @@ def test_seeded_user_can_login(client):
         "password": "testpass"
     })
     assert resp.status_code == 200
+
+
+def test_register_sets_session_cookie(client):
+    """POST /register should set session cookie (auto-login)."""
+    resp = client.post("/register", json={
+        "username": "eve",
+        "password": "secret123"
+    })
+    assert resp.status_code == 201
+    assert "Set-Cookie" in resp.headers
+    assert "session_token" in resp.headers["Set-Cookie"]
+
+
+def test_register_then_access_authorize(client):
+    """After registration, the session cookie should allow accessing /authorize."""
+    resp = client.post("/register", json={
+        "username": "frank",
+        "password": "secret123"
+    })
+    assert resp.status_code == 201
+    cookie = resp.headers["Set-Cookie"]
+
+    # Use the cookie to access /authorize (should get consent page, not login redirect)
+    params = {
+        "response_type": "code",
+        "client_id": "flavor-code-cli",
+        "redirect_uri": "http://127.0.0.1:9999/callback",
+        "code_challenge": "test-challenge",
+        "code_challenge_method": "S256",
+        "state": "test-state",
+    }
+    resp = client.get("/authorize", params=params, headers={"Cookie": cookie})
+    assert resp.status_code == 200
+    assert "Authorization Request" in resp.text

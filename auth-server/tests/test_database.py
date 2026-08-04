@@ -1,27 +1,33 @@
 """Test database schema and operations."""
 import os
+import tempfile
 import pytest
 import sqlite3
 from pathlib import Path
 
-from auth_server.database import get_db, init_db, DB_PATH
+from auth_server.database import get_db, init_db
+import auth_server.config as config
+
+_original_db_path = config.DB_PATH
 
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    """Remove test database before each test."""
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    """Use a temporary database for each test."""
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="db_test_")
+    os.close(fd)
+    config.DB_PATH = tmp_path
     yield
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    config.DB_PATH = _original_db_path
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
 
 
 def test_init_db_creates_tables():
     """Database initialization should create all required tables."""
     init_db()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH)
     cursor = conn.cursor()
 
     # Check tables exist
@@ -43,7 +49,7 @@ def test_init_db_creates_tables():
 def test_clients_schema():
     """Clients table should have correct columns."""
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("PRAGMA table_info(clients)")
@@ -59,7 +65,7 @@ def test_clients_schema():
 def test_users_schema():
     """Users table should have correct columns."""
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("PRAGMA table_info(users)")
@@ -68,14 +74,45 @@ def test_users_schema():
     assert "id" in columns
     assert "username" in columns
     assert "password_hash" in columns
+    assert "role" in columns
     assert "created_at" in columns
     conn.close()
+
+
+def test_init_db_migrates_existing_users_to_regular_role():
+    """Older databases gain the role column without losing existing users."""
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.execute("""
+        CREATE TABLE users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute(
+        "INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)",
+        ("legacy-id", "legacy-user", "legacy-hash"),
+    )
+    conn.commit()
+    conn.close()
+
+    init_db()
+
+    conn = sqlite3.connect(config.DB_PATH)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    role = conn.execute(
+        "SELECT role FROM users WHERE id = ?", ("legacy-id",),
+    ).fetchone()[0]
+    conn.close()
+    assert "role" in columns
+    assert role == "user"
 
 
 def test_authorization_codes_schema():
     """Authorization codes table should have correct columns with foreign keys."""
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("PRAGMA table_info(authorization_codes)")
@@ -96,7 +133,7 @@ def test_authorization_codes_schema():
 def test_tokens_schema():
     """Tokens table should have correct columns."""
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("PRAGMA table_info(tokens)")
@@ -116,7 +153,7 @@ def test_tokens_schema():
 def test_seed_data_creates_default_client():
     """Init should seed a default client and test user."""
     init_db()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(config.DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("SELECT id, name, redirect_uris FROM clients WHERE id = ?",

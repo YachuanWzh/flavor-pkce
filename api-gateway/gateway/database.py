@@ -1,0 +1,241 @@
+"""SQLite audit-log storage for the API Gateway.
+
+Provides helpers to initialise the schema, insert log entries, and query
+them with date/keyword filtering and pagination.
+"""
+
+import sqlite3
+from pathlib import Path
+from typing import TypedDict
+
+import gateway.config
+
+# Maximum characters stored per body field to prevent unbounded DB growth.
+_BODY_MAX_CHARS = 50_000
+
+
+def _truncate_body(text: str | None) -> str | None:
+    """Truncate body text to _BODY_MAX_CHARS, appending a marker if clipped."""
+    if text is None:
+        return None
+    if len(text) <= _BODY_MAX_CHARS:
+        return text
+    return text[:_BODY_MAX_CHARS] + "\n…[truncated]"
+
+
+def _connect() -> sqlite3.Connection:
+    """Return a new connection with row-factory enabled."""
+    conn = sqlite3.connect(gateway.config.AUDIT_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_audit_db() -> None:
+    """Create the audit_logs table and indexes if they don't exist."""
+    Path(gateway.config.AUDIT_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = _connect()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp         TEXT    NOT NULL,
+            "user"            TEXT    NOT NULL,
+            method            TEXT    NOT NULL,
+            path              TEXT    NOT NULL,
+            status            INTEGER NOT NULL,
+            duration_ms       REAL    NOT NULL,
+            upstream_ms       REAL,
+            level             TEXT    NOT NULL,
+            prompt_tokens     INTEGER,
+            completion_tokens INTEGER,
+            model             TEXT,
+            session_id        TEXT,
+            request_body      TEXT,
+            response_body     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_audit_user      ON audit_logs("user");
+        CREATE INDEX IF NOT EXISTS idx_audit_path      ON audit_logs(path);
+    """)
+    # Migrate existing databases that lack newer columns.
+    for col, col_type in (
+        ("prompt_tokens", "INTEGER"),
+        ("completion_tokens", "INTEGER"),
+        ("model", "TEXT"),
+        ("session_id", "TEXT"),
+        ("request_body", "TEXT"),
+        ("response_body", "TEXT"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE audit_logs ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # Ensure indexes for optional columns exist (only after columns are guaranteed to exist).
+    for idx_name, idx_col in (
+        ("idx_audit_model", "model"),
+        ("idx_audit_session", "session_id"),
+    ):
+        try:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON audit_logs({idx_col})")
+        except sqlite3.OperationalError:
+            pass
+
+    conn.commit()
+    conn.close()
+
+
+def insert_log(
+    *,
+    timestamp: str,
+    user: str,
+    method: str,
+    path: str,
+    status: int,
+    duration_ms: float,
+    upstream_ms: float | None,
+    level: str,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    model: str | None = None,
+    session_id: str | None = None,
+    request_body: str | None = None,
+    response_body: str | None = None,
+) -> None:
+    """Insert a single audit-log row.
+
+    Body fields are truncated to ``_BODY_MAX_CHARS`` to prevent unbounded
+    storage growth from large LLM payloads.
+    """
+    conn = _connect()
+    conn.execute(
+        """INSERT INTO audit_logs
+           (timestamp, "user", method, path, status, duration_ms,
+            upstream_ms, level, prompt_tokens, completion_tokens, model,
+            session_id, request_body, response_body)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (timestamp, user, method, path, status, duration_ms,
+         upstream_ms, level, prompt_tokens, completion_tokens, model,
+         session_id,
+         _truncate_body(request_body),
+         _truncate_body(response_body)),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+class QueryParams(TypedDict, total=False):
+    page: int
+    page_size: int
+    start_date: str | None
+    end_date: str | None
+    keyword: str | None
+    user: str | None
+
+
+class PageResult(TypedDict):
+    total: int
+    page: int
+    page_size: int
+    items: list[dict]
+
+
+def query_logs(params: QueryParams) -> PageResult:
+    """Return a paginated page of audit-log entries.
+
+    Parameters
+    ----------
+    params :
+        ``page``        — 1-based page number (default 1).
+        ``page_size``   — entries per page (default 20, max 200).
+        ``start_date``  — ISO date string (inclusive), e.g. ``"2026-07-01"``.
+        ``end_date``    — ISO date string (inclusive), e.g. ``"2026-07-22"``.
+        ``keyword``     — case-insensitive substring match on ``user`` and ``path``.
+        ``user``        — exact match on ``user``.
+    """
+    page = max(1, params.get("page", 1))
+    page_size = min(max(1, params.get("page_size", 20)), 200)
+
+    conditions: list[str] = []
+    bindings: list[object] = []
+
+    if params.get("start_date"):
+        conditions.append("timestamp >= ?")
+        bindings.append(params["start_date"] + "T00:00:00+00:00")
+
+    if params.get("end_date"):
+        conditions.append("timestamp <= ?")
+        bindings.append(params["end_date"] + "T23:59:59.999999+00:00")
+
+    if params.get("keyword"):
+        kw = params["keyword"]
+        conditions.append(
+            '("user" LIKE ? OR path LIKE ? OR model LIKE ?'
+            ' OR session_id LIKE ? OR request_body LIKE ?'
+            ' OR response_body LIKE ?)'
+        )
+        like = f"%{kw}%"
+        bindings.extend([like, like, like, like, like, like])
+
+    if params.get("user"):
+        conditions.append('"user" = ?')
+        bindings.append(params["user"])
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    order = "ORDER BY id DESC"
+
+    # Column list for the list view — excludes heavy body fields.
+    _LIST_COLS = (
+        "id, timestamp, \"user\", method, path, status, duration_ms,"
+        " upstream_ms, level, prompt_tokens, completion_tokens, model,"
+        " session_id"
+    )
+
+    conn = _connect()
+
+    # Total count
+    count_row = conn.execute(
+        f"SELECT COUNT(*) FROM audit_logs {where}", bindings
+    ).fetchone()
+    total = count_row[0] if count_row else 0
+
+    # Page
+    offset = (page - 1) * page_size
+    rows = conn.execute(
+        f"SELECT {_LIST_COLS} FROM audit_logs {where} {order} LIMIT ? OFFSET ?",
+        [*bindings, page_size, offset],
+    ).fetchall()
+
+    conn.close()
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [dict(row) for row in rows],
+    }
+
+
+def query_log_by_id(log_id: int) -> dict | None:
+    """Return a single log entry by primary key, including body columns."""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT * FROM audit_logs WHERE id = ?", (log_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def clear_logs() -> int:
+    """Delete all rows from the audit_logs table. Returns deleted count."""
+    conn = _connect()
+    count = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
+    conn.execute("DELETE FROM audit_logs")
+    conn.commit()
+    conn.close()
+    return count

@@ -65,13 +65,17 @@ def _load_private_key():
         )
 
 
-def create_jwt(sub: str, client_id: str, scope: str = "") -> str:
+def create_jwt(
+    sub: str, client_id: str, scope: str = "", username: str = "",
+    config_version: int | None = None,
+) -> str:
     """Create a signed JWT access token.
 
     Args:
         sub: User ID (subject claim)
         client_id: OAuth client ID
         scope: Space-separated scopes
+        username: Human-readable username (for audit logs)
 
     Returns:
         Signed JWT string
@@ -86,7 +90,10 @@ def create_jwt(sub: str, client_id: str, scope: str = "") -> str:
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=JWT_EXPIRES_IN)).timestamp()),
         "jti": jti,
+        "username": username or sub,
     }
+    if config_version is not None:
+        payload["config_version"] = config_version
 
     private_key = _load_private_key()
     token = pyjwt.encode(payload, private_key, algorithm=JWT_ALGORITHM)

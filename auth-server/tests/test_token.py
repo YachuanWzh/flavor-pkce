@@ -101,11 +101,19 @@ def test_token_exchange_success(client):
     assert data["token_type"] == "Bearer"
     assert "expires_in" in data
     assert data["expires_in"] == 259200
+    assert data["config_version"] >= 1
+    assert data["llm_config"]["base_url"].startswith("http")
+    assert data["llm_config"]["default_model"]
+    assert "upstream_url" not in data["llm_config"]
+    assert "upstream_api_key" not in data["llm_config"]
 
     # Verify it's a JWT (3 parts separated by dots)
     access_token = data["access_token"]
     parts = access_token.split(".")
     assert len(parts) == 3
+    import jwt
+    decoded = jwt.decode(access_token, options={"verify_signature": False})
+    assert decoded["config_version"] == data["config_version"]
 
 
 def test_token_exchange_wrong_code_verifier(client):
@@ -248,3 +256,22 @@ def test_token_stored_with_jti(client):
     assert row is not None
     assert row["client_id"] == "flavor-code-cli"
     assert row["revoked"] == 0
+
+
+def test_jwt_contains_username(client):
+    """The JWT payload should include a 'username' claim."""
+    code, code_verifier, _state = complete_authorization_flow(client)
+
+    resp = client.post("/token", data={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "http://127.0.0.1:9999/callback",
+        "client_id": "flavor-code-cli",
+        "code_verifier": code_verifier,
+    })
+    assert resp.status_code == 200
+
+    import jwt
+    access_token = resp.json()["access_token"]
+    decoded = jwt.decode(access_token, options={"verify_signature": False})
+    assert decoded.get("username") == "testuser"

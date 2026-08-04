@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
-const AUTH_SERVER = "http://localhost:8091";
+const AUTH_SERVER = "";
 
 export default function LoginPage() {
   const [username, setUsername] = useState("");
@@ -39,7 +39,7 @@ export default function LoginPage() {
       if (returnUrl) {
         window.location.href = `${AUTH_SERVER}${returnUrl}`;
       } else {
-        window.location.href = `${AUTH_SERVER}/`;
+        window.location.href = `${AUTH_SERVER}/settings/llm`;
       }
     } catch {
       setError("Network error. Check if the auth server is running.");
@@ -156,7 +156,10 @@ export default function LoginPage() {
         </form>
 
         <div className="auth-footer">
-          Don&apos;t have an account? <Link to="/register">Create one</Link>
+          Don&apos;t have an account?{" "}
+          <Link to={`/register${returnUrl ? `?return_url=${encodeURIComponent(returnUrl)}` : ""}`}>
+            Create one
+          </Link>
         </div>
       </div>
     </div>

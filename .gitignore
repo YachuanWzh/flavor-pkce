@@ -15,6 +15,9 @@ auth-server/auth.db
 # Env files (API keys, secrets)
 .env
 
+# Deployment scripts that embed server credentials
+setup_ssh.py
+
 # IDE
 .idea/
 .vscode/

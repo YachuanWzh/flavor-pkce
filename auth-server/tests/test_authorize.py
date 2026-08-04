@@ -1,5 +1,6 @@
 """Test PKCE /authorize endpoint."""
 import os
+import tempfile
 import hashlib
 import base64
 import secrets
@@ -7,19 +8,23 @@ import secrets
 import pytest
 from fastapi.testclient import TestClient
 
-from auth_server.database import init_db, DB_PATH, get_db
+from auth_server.database import init_db, get_db
 import auth_server.config as config
+
+_original_db_path = config.DB_PATH
 
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    config.DB_PATH = DB_PATH
+    """Use a temporary database for each test."""
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="auth_test_")
+    os.close(fd)
+    config.DB_PATH = tmp_path
     init_db()
     yield
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+    config.DB_PATH = _original_db_path
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
 
 
 @pytest.fixture

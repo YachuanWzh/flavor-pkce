@@ -56,6 +56,9 @@ def test_full_pkce_e2e():
     from auth_server.jwt_utils import _ensure_keys_exist
     _ensure_keys_exist()
 
+    # Point gateway to the same public key path used by auth-server
+    os.environ["JWT_PUBLIC_KEY_PATH"] = auth_config.JWT_PUBLIC_KEY_PATH
+
     from auth_server.main import app as auth_app
     from gateway.main import verify_jwt
 

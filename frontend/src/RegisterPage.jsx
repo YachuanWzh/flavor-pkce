@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
-const AUTH_SERVER = "http://localhost:8091";
+const AUTH_SERVER = "";
 
 export default function RegisterPage() {
   const [username, setUsername] = useState("");
@@ -12,7 +12,8 @@ export default function RegisterPage() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [loading, setLoading] = useState(false);
-  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const returnUrl = searchParams.get("return_url") || "";
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -36,6 +37,7 @@ export default function RegisterPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
+        credentials: "include",
       });
 
       const data = await resp.json();
@@ -45,8 +47,14 @@ export default function RegisterPage() {
         return;
       }
 
-      setSuccess("Account created! Redirecting to login...");
-      setTimeout(() => navigate("/login"), 1500);
+      setSuccess("Account created! Redirecting...");
+      setTimeout(() => {
+        if (returnUrl) {
+          window.location.href = `${AUTH_SERVER}${returnUrl}`;
+        } else {
+          window.location.href = `${AUTH_SERVER}/settings/llm`;
+        }
+      }, 800);
     } catch {
       setError("Network error. Check if the auth server is running.");
     } finally {
@@ -220,7 +228,10 @@ export default function RegisterPage() {
         </form>
 
         <div className="auth-footer">
-          Already have an account? <Link to="/login">Sign in</Link>
+          Already have an account?{" "}
+          <Link to={`/login${returnUrl ? `?return_url=${encodeURIComponent(returnUrl)}` : ""}`}>
+            Sign in
+          </Link>
         </div>
       </div>
     </div>

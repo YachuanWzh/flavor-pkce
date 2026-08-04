@@ -2,6 +2,8 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import LoginPage from "./LoginPage";
 import RegisterPage from "./RegisterPage";
 import ConsentPage from "./ConsentPage";
+import LlmSettingsPage from "./LlmSettingsPage";
+import AdminLlmSettingsPage from "./AdminLlmSettingsPage";
 import "./App.css";
 
 function Home() {
@@ -25,6 +27,8 @@ export default function App() {
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
         <Route path="/consent" element={<ConsentPage />} />
+        <Route path="/settings/llm" element={<LlmSettingsPage />} />
+        <Route path="/admin/llm-configs" element={<AdminLlmSettingsPage />} />
       </Routes>
     </BrowserRouter>
   );

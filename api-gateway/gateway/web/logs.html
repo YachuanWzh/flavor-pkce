@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gateway Audit Logs</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e1e4ed;
+    --muted: #8b8fa3;
+    --accent: #5b8def;
+    --accent-hover: #7ba5f5;
+    --success: #34d399;
+    --error: #f87171;
+    --warn: #fbbf24;
+    --radius: 8px;
+    --shadow: 0 2px 8px rgba(0,0,0,.3);
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 2rem 1.5rem;
+  }
+  .container { max-width: 1400px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 1.5rem; flex-wrap: wrap; gap: 0.75rem;
+  }
+  h1 { font-size: 1.5rem; font-weight: 600; color: var(--text); }
+  .badge {
+    background: var(--card); border: 1px solid var(--border);
+    padding: 0.25rem 0.75rem; border-radius: 999px;
+    font-size: 0.8rem; color: var(--muted);
+  }
+
+  /* ---- Filters ---- */
+  .filters {
+    display: flex; flex-wrap: wrap; gap: 0.6rem; margin-bottom: 1.25rem;
+    align-items: flex-end;
+  }
+  .filter-group { display: flex; flex-direction: column; gap: 0.25rem; }
+  .filter-group label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .filter-group input {
+    background: var(--card); border: 1px solid var(--border);
+    color: var(--text); padding: 0.45rem 0.65rem; border-radius: var(--radius);
+    font-size: 0.875rem; outline: none; min-width: 140px;
+    transition: border-color .15s;
+  }
+  .filter-group input:focus { border-color: var(--accent); }
+  .filter-group input::placeholder { color: #555; }
+  button {
+    background: var(--accent); border: none; color: #fff;
+    padding: 0.45rem 1rem; border-radius: var(--radius); font-size: 0.875rem;
+    cursor: pointer; transition: background .15s; font-weight: 500;
+    white-space: nowrap;
+  }
+  button:hover { background: var(--accent-hover); }
+  button.secondary {
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+  }
+  button.secondary:hover { color: var(--text); border-color: var(--accent); }
+  button.danger {
+    background: transparent; border: 1px solid rgba(248,113,113,.35); color: var(--error);
+  }
+  button.danger:hover { background: rgba(248,113,113,.12); border-color: var(--error); }
+
+  /* ---- Table ---- */
+  .table-wrap {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: auto;
+    box-shadow: var(--shadow);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th {
+    text-align: left; padding: 0.65rem 0.85rem;
+    font-weight: 600; color: var(--muted); font-size: 0.75rem;
+    text-transform: uppercase; letter-spacing: 0.04em;
+    background: rgba(255,255,255,.02); border-bottom: 1px solid var(--border);
+  }
+  td {
+    padding: 0.55rem 0.85rem; border-bottom: 1px solid rgba(255,255,255,.04);
+    white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,.015); }
+
+  .status-badge {
+    display: inline-block; padding: 0.15rem 0.5rem; border-radius: 999px;
+    font-size: 0.75rem; font-weight: 600;
+  }
+  .status-2xx { background: rgba(52,211,153,.15); color: var(--success); }
+  .status-4xx { background: rgba(251,191,36,.15); color: var(--warn); }
+  .status-5xx { background: rgba(248,113,113,.15); color: var(--error); }
+
+  .level-error { color: var(--error); font-weight: 600; }
+  .level-info  { color: var(--muted); }
+
+  .mono { font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace; font-size: 0.8rem; }
+
+  /* ---- Pagination ---- */
+  .pagination {
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem;
+  }
+  .pagination .info { color: var(--muted); font-size: 0.8rem; }
+  .pagination .pages { display: flex; gap: 0.3rem; }
+  .pagination button { min-width: 36px; text-align: center; }
+
+  /* ---- Empty / Loading ---- */
+  .empty {
+    text-align: center; padding: 3rem 1rem; color: var(--muted);
+  }
+  .empty p { margin-top: 0.5rem; font-size: 0.9rem; }
+
+  .loading { text-align: center; padding: 2rem; color: var(--muted); }
+  .spinner {
+    display: inline-block; width: 24px; height: 24px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .error-msg {
+    background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.2);
+    padding: 0.75rem 1rem; border-radius: var(--radius);
+    color: var(--error); margin-bottom: 1rem; font-size: 0.85rem;
+  }
+
+  /* ---- Modal ---- */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0,0,0,.65); align-items: center; justify-content: center;
+  }
+  .modal-overlay.active { display: flex; }
+  .modal {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.5rem; max-width: 540px; width: 90%;
+    box-shadow: 0 8px 32px rgba(0,0,0,.5); max-height: 85vh; overflow-y: auto;
+  }
+  .modal h2 {
+    font-size: 1.15rem; font-weight: 600; margin-bottom: 1rem;
+    color: var(--text);
+  }
+  .modal .detail-grid {
+    display: grid; grid-template-columns: 130px 1fr; gap: 0.5rem 1rem;
+    font-size: 0.85rem;
+  }
+  .modal .detail-label { color: var(--muted); font-weight: 500; }
+  .modal .detail-value { color: var(--text); word-break: break-all; }
+  .modal .detail-value.mono { font-family: "JetBrains Mono","Fira Code","Cascadia Code",monospace; font-size: 0.8rem; }
+  .modal .modal-actions {
+    display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;
+  }
+  .modal button { font-size: 0.8rem; padding: 0.4rem 0.9rem; }
+
+  .detail-btn {
+    background: transparent; border: 1px solid var(--border);
+    color: var(--muted); padding: 0.2rem 0.5rem; border-radius: 4px;
+    font-size: 0.75rem; cursor: pointer; transition: all .15s;
+  }
+  .detail-btn:hover { color: var(--text); border-color: var(--accent); background: rgba(91,141,239,.08); }
+  .detail-btn.loading { pointer-events: none; opacity: .5; }
+
+  /* ---- Body display in modal ---- */
+  .body-section { margin-top: 1rem; }
+  .body-section h3 {
+    font-size: 0.78rem; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem;
+  }
+  .body-block {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.65rem 0.8rem; font-family: "JetBrains Mono","Fira Code","Cascadia Code",monospace;
+    font-size: 0.75rem; line-height: 1.5; color: var(--text);
+    white-space: pre-wrap; word-break: break-all;
+    max-height: 260px; overflow-y: auto; margin-bottom: 0.75rem;
+  }
+  .body-block.empty { color: var(--muted); font-style: italic; white-space: normal; }
+
+  /* ---- Scrollbar ---- */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+  * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+  @media (max-width: 600px) {
+    body { padding: 1rem; }
+    .filter-group input { min-width: 100px; }
+    td { padding: 0.45rem 0.5rem; font-size: 0.78rem; }
+    .modal .detail-grid { grid-template-columns: 100px 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Gateway Audit Logs</h1>
+    <span class="badge" id="autoRefreshBadge">Auto-refresh: off</span>
+  </header>
+
+  <!-- Filters -->
+  <div class="filters">
+    <div class="filter-group">
+      <label for="startDate">Start Date</label>
+      <input type="date" id="startDate">
+    </div>
+    <div class="filter-group">
+      <label for="endDate">End Date</label>
+      <input type="date" id="endDate">
+    </div>
+    <div class="filter-group">
+      <label for="keyword">Keyword</label>
+      <input type="text" id="keyword" placeholder="user / path / body …">
+    </div>
+    <div class="filter-group">
+      <label for="userFilter">User</label>
+      <input type="text" id="userFilter" placeholder="exact match">
+    </div>
+    <button id="searchBtn">Search</button>
+    <button class="secondary" id="resetBtn">Reset</button>
+    <button class="secondary" id="refreshBtn" title="Toggle auto-refresh">⟳ 10s</button>
+    <button class="danger" id="clearBtn" title="Delete all audit log entries">Clear All</button>
+  </div>
+
+  <div id="errorArea"></div>
+
+  <!-- Table -->
+  <div class="table-wrap">
+    <div class="loading" id="loading"><div class="spinner"></div></div>
+    <table id="logTable" style="display:none">
+      <thead>
+        <tr>
+          <th>Time (UTC)</th>
+          <th>User</th>
+          <th>Session ID</th>
+          <th>Method</th>
+          <th>Path</th>
+          <th>Model</th>
+          <th>Status</th>
+          <th>Duration</th>
+          <th>Upstream</th>
+          <th>Tokens (in → out)</th>
+          <th>Level</th>
+          <th>Details</th>
+        </tr>
+      </thead>
+      <tbody id="logBody"></tbody>
+    </table>
+    <div class="empty" id="emptyState" style="display:none">
+      <p>No logs found for the current filters.</p>
+    </div>
+  </div>
+
+  <!-- Pagination -->
+  <div class="pagination" id="pagBar" style="display:none">
+    <span class="info" id="pagInfo"></span>
+    <div class="pages" id="pagButtons"></div>
+  </div>
+
+  <!-- Detail Modal -->
+  <div class="modal-overlay" id="detailModal">
+    <div class="modal">
+      <h2>Session Detail</h2>
+      <div class="detail-grid" id="detailGrid"></div>
+      <div class="modal-actions">
+        <button class="secondary" id="modalCloseBtn">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/api/logs';
+let autoRefresh = false;
+let refreshTimer = null;
+
+// ---- Helpers ----
+function $(id) { return document.getElementById(id); }
+function fmtMs(ms) { return ms != null ? ms.toFixed(1) + ' ms' : '—'; }
+function statusClass(s) {
+  if (s >= 500) return 'status-5xx';
+  if (s >= 400) return 'status-4xx';
+  if (s >= 200) return 'status-2xx';
+  return '';
+}
+
+// ---- Fetch & Render ----
+async function fetchLogs(page = 1) {
+  const params = new URLSearchParams();
+  params.set('page', String(page));
+  params.set('page_size', '20');
+
+  const sd = $('startDate').value;
+  const ed = $('endDate').value;
+  const kw = $('keyword').value.trim();
+  const u  = $('userFilter').value.trim();
+
+  if (sd) params.set('start_date', sd);
+  if (ed) params.set('end_date', ed);
+  if (kw) params.set('keyword', kw);
+  if (u)  params.set('user', u);
+
+  $('errorArea').innerHTML = '';
+  $('loading').style.display = 'block';
+  $('logTable').style.display = 'none';
+  $('emptyState').style.display = 'none';
+  $('pagBar').style.display = 'none';
+
+  try {
+    const resp = await fetch(`${API}?${params}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    render(data);
+  } catch (err) {
+    $('errorArea').innerHTML = `<div class="error-msg">Failed to load logs: ${err.message}</div>`;
+    $('loading').style.display = 'none';
+    $('emptyState').style.display = 'block';
+  }
+}
+
+function render(data) {
+  $('loading').style.display = 'none';
+
+  if (!data.items || data.items.length === 0) {
+    $('emptyState').style.display = 'block';
+    return;
+  }
+
+  const tbody = $('logBody');
+  tbody.innerHTML = data.items.map(row => {
+    const pt = row.prompt_tokens;
+    const ct = row.completion_tokens;
+    const tokens = (pt != null || ct != null)
+      ? `${pt ?? '—'} → ${ct ?? '—'}`
+      : '—';
+    const sid = row.session_id || '—';
+    return `
+    <tr>
+      <td class="mono">${escapeHtml(row.timestamp)}</td>
+      <td>${escapeHtml(row.user)}</td>
+      <td class="mono" style="max-width:180px;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(sid)}">${escapeHtml(sid)}</td>
+      <td>${escapeHtml(row.method)}</td>
+      <td class="mono">${escapeHtml(row.path)}</td>
+      <td class="mono">${escapeHtml(row.model || '—')}</td>
+      <td><span class="status-badge ${statusClass(row.status)}">${row.status}</span></td>
+      <td>${fmtMs(row.duration_ms)}</td>
+      <td>${fmtMs(row.upstream_ms)}</td>
+      <td class="mono">${tokens}</td>
+      <td class="${row.level === 'ERROR' ? 'level-error' : 'level-info'}">${escapeHtml(row.level)}</td>
+      <td><button class="detail-btn" onclick="showDetail(${row.id}, this)">📋</button></td>
+    </tr>
+    `;
+  }).join('');
+
+  $('logTable').style.display = 'table';
+
+  // Pagination
+  const totalPages = Math.ceil(data.total / data.page_size);
+  $('pagInfo').textContent = `Showing ${((data.page-1)*data.page_size)+1}–${Math.min(data.page*data.page_size, data.total)} of ${data.total}`;
+
+  const btnDiv = $('pagButtons');
+  btnDiv.innerHTML = '';
+
+  if (data.page > 1) {
+    const prev = document.createElement('button');
+    prev.textContent = '‹';
+    prev.title = 'Previous';
+    prev.onclick = () => fetchLogs(data.page - 1);
+    btnDiv.appendChild(prev);
+  }
+
+  const start = Math.max(1, data.page - 3);
+  const end = Math.min(totalPages, data.page + 3);
+  for (let i = start; i <= end; i++) {
+    const b = document.createElement('button');
+    b.textContent = String(i);
+    if (i === data.page) b.style.background = 'var(--accent)';
+    else { b.className = 'secondary'; b.style.minWidth = '36px'; }
+    b.onclick = () => fetchLogs(i);
+    btnDiv.appendChild(b);
+  }
+
+  if (data.page < totalPages) {
+    const next = document.createElement('button');
+    next.textContent = '›';
+    next.title = 'Next';
+    next.onclick = () => fetchLogs(data.page + 1);
+    btnDiv.appendChild(next);
+  }
+
+  $('pagBar').style.display = 'flex';
+}
+
+function escapeHtml(text) {
+  const el = document.createElement('span');
+  el.textContent = text;
+  return el.innerHTML;
+}
+
+// ---- Auto-refresh ----
+function toggleAutoRefresh() {
+  autoRefresh = !autoRefresh;
+  $('refreshBtn').textContent = autoRefresh ? '⟳ Stop' : '⟳ 10s';
+  $('autoRefreshBadge').textContent = autoRefresh ? 'Auto-refresh: 10s' : 'Auto-refresh: off';
+  if (autoRefresh) {
+    refreshTimer = setInterval(() => fetchLogs(), 10_000);
+  } else {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+// ---- Detail Modal ----
+async function showDetail(logId, btn) {
+  btn.classList.add('loading');
+  btn.textContent = '…';
+
+  const grid = $('detailGrid');
+  grid.innerHTML = '<span class="detail-label" style="grid-column:1/-1;text-align:center;padding:1rem">Loading…</span>';
+
+  // Clear previous body sections
+  const oldBody = document.getElementById('bodySections');
+  if (oldBody) oldBody.remove();
+
+  $('detailModal').classList.add('active');
+
+  try {
+    const resp = await fetch(`/api/logs/${logId}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const row = await resp.json();
+    renderDetail(row);
+  } catch (err) {
+    grid.innerHTML = `<span class="detail-label" style="grid-column:1/-1;text-align:center;color:var(--error)">Failed: ${escapeHtml(err.message)}</span>`;
+  } finally {
+    btn.classList.remove('loading');
+    btn.textContent = '📋';
+  }
+}
+
+function renderDetail(row) {
+  const grid = $('detailGrid');
+  const fields = [
+    ['ID', row.id],
+    ['Time (UTC)', row.timestamp],
+    ['User', row.user],
+    ['Session ID', row.session_id || '—'],
+    ['Method', row.method],
+    ['Path', row.path],
+    ['Model', row.model || '—'],
+    ['Status', row.status],
+    ['Duration', fmtMs(row.duration_ms)],
+    ['Upstream', fmtMs(row.upstream_ms)],
+    ['Prompt Tokens', row.prompt_tokens != null ? row.prompt_tokens : '—'],
+    ['Completion Tokens', row.completion_tokens != null ? row.completion_tokens : '—'],
+    ['Level', row.level],
+  ];
+  grid.innerHTML = fields.map(([label, value]) => `
+    <span class="detail-label">${escapeHtml(String(label))}</span>
+    <span class="detail-value${label === 'Session ID' || label === 'Path' ? ' mono' : ''}">${escapeHtml(String(value))}</span>
+  `).join('');
+
+  // Append body sections after the grid
+  const bodyHtml = buildBodyHtml(row);
+  if (bodyHtml) {
+    grid.insertAdjacentHTML('afterend', bodyHtml);
+  }
+}
+
+function buildBodyHtml(row) {
+  const sections = [];
+  const reqBody = row.request_body;
+  const respBody = row.response_body;
+
+  if (reqBody != null) {
+    const formatted = tryFormatJson(reqBody);
+    sections.push(`<div class="body-section"><h3>Request Body</h3><div class="body-block">${escapeHtml(formatted)}</div></div>`);
+  }
+  if (respBody != null) {
+    const formatted = tryFormatJson(respBody);
+    sections.push(`<div class="body-section"><h3>Response Body</h3><div class="body-block">${escapeHtml(formatted)}</div></div>`);
+  }
+
+  return sections.length ? `<div id="bodySections">${sections.join('')}</div>` : '';
+}
+
+function tryFormatJson(text) {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    return text;
+  }
+}
+
+function hideDetail() {
+  $('detailModal').classList.remove('active');
+}
+
+$('detailModal').addEventListener('click', (e) => {
+  if (e.target === $('detailModal')) hideDetail();
+});
+$('modalCloseBtn').addEventListener('click', hideDetail);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('detailModal').classList.contains('active')) hideDetail();
+});
+
+// ---- Event wiring ----
+$('searchBtn').addEventListener('click', () => fetchLogs(1));
+$('resetBtn').addEventListener('click', () => {
+  $('startDate').value = '';
+  $('endDate').value = '';
+  $('keyword').value = '';
+  $('userFilter').value = '';
+  fetchLogs(1);
+});
+$('refreshBtn').addEventListener('click', toggleAutoRefresh);
+$('clearBtn').addEventListener('click', async () => {
+  if (!confirm('Delete ALL audit log entries? This cannot be undone.')) return;
+  try {
+    const resp = await fetch('/api/logs', { method: 'DELETE' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    $('errorArea').innerHTML = '';
+    fetchLogs(1);
+  } catch (err) {
+    $('errorArea').innerHTML = `<div class="error-msg">Clear failed: ${err.message}</div>`;
+  }
+});
+
+// Allow Enter key in filter inputs to trigger search
+document.querySelectorAll('.filter-group input').forEach(el => {
+  el.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchLogs(1); });
+});
+
+// Initial load
+fetchLogs(1);
+</script>
+</body>
+</html>
