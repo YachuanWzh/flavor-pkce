@@ -35,7 +35,7 @@ def client():
     return TestClient(app)
 
 
-def _login(client, username="alice", password="secret123"):
+def _login(client, username="alice", password="Secret123"):
     client.post("/register", json={"username": username, "password": password})
     resp = client.post("/login", data={"username": username, "password": password})
     assert resp.status_code == 200
@@ -71,7 +71,7 @@ def test_login_persists_session_row(client):
 
 def test_register_persists_session_row(client):
     """Auto-login after registration must also persist the session."""
-    resp = client.post("/register", json={"username": "bob", "password": "secret123"})
+    resp = client.post("/register", json={"username": "bob", "password": "Secret123"})
     assert resp.status_code == 201
     cookie = resp.headers["Set-Cookie"]
     assert "session_token=" in cookie

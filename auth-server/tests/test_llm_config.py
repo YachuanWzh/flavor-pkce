@@ -91,7 +91,7 @@ def test_configs_are_isolated_by_user(client):
     login(client)
     client.put("/api/me/llm-config", json=sample_config(service_name="Test User LLM"))
 
-    client.post("/register", json={"username": "alice", "password": "alice-pass"})
+    client.post("/register", json={"username": "alice", "password": "AlicePass1"})
     client.put("/api/me/llm-config", json=sample_config(
         provider_id="qwen", service_name="Alice LLM",
         default_model="qwen3-coder", cheap_model="qwen3-coder-fast",

@@ -57,6 +57,23 @@ class RegisterRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=128)
 
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, value: str) -> str:
+        import re as _re
+        from auth_server.config import PASSWORD_MIN_LENGTH
+        if len(value) < PASSWORD_MIN_LENGTH:
+            raise ValueError(
+                f"Password must be at least {PASSWORD_MIN_LENGTH} characters"
+            )
+        if not _re.search(r"[a-z]", value):
+            raise ValueError("Password must contain a lowercase letter")
+        if not _re.search(r"[A-Z]", value):
+            raise ValueError("Password must contain an uppercase letter")
+        if not _re.search(r"[0-9]", value):
+            raise ValueError("Password must contain a digit")
+        return value
+
 
 class LlmConfigUpdate(BaseModel):
     provider_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")

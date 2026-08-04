@@ -15,6 +15,9 @@ AUTH_CODE_EXPIRES_IN = 600  # 10 minutes
 AUTH_HOST = os.environ.get("AUTH_HOST", "0.0.0.0")
 AUTH_PORT = int(os.environ.get("AUTH_PORT", "8091"))
 
+# Password strength policy (P0-9)
+PASSWORD_MIN_LENGTH = int(os.environ.get("PASSWORD_MIN_LENGTH", "8"))
+
 # Public gateway metadata and private gateway-to-auth credential.
 PUBLIC_GATEWAY_URL = os.environ.get("PUBLIC_GATEWAY_URL", "http://127.0.0.1:8092")
 INTERNAL_SERVICE_TOKEN = os.environ.get("INTERNAL_SERVICE_TOKEN", "dev-internal-token-change-me")
