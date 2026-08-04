@@ -33,3 +33,5 @@ api-gateway/.pytest_cache/
 .claude/superharness/brainstorm/
 # superharness brainstorm mind-map session state (transient)
 .superharness/
+
+.worktrees/
