@@ -1,0 +1,10 @@
+{
+  "name": "superharness",
+  "description": "Project-level autonomous engineering harness: TDD-first workflow, systematic debugging, planning and verification skills. Invoke /superharness:go <goal> to run a task end-to-end. Includes /superharness:brainstorm with a live mind map.",
+  "version": "2.0.0",
+  "author": {
+    "name": "wangzh"
+  },
+  "license": "MIT",
+  "keywords": ["tdd", "workflow", "harness", "skills"]
+}

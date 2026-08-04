@@ -1,0 +1,11 @@
+{
+  "name": "superharness",
+  "owner": { "name": "wangzh" },
+  "plugins": [
+    {
+      "name": "superharness",
+      "source": "./plugins/superharness",
+      "description": "Project-level autonomous engineering harness: TDD-first workflow, systematic debugging, planning, verification, and mind-map brainstorming."
+    }
+  ]
+}

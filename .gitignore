@@ -27,3 +27,9 @@ frontend/dist/
 auth-server/.pytest_cache/
 api-gateway/.pytest_cache/
 .pytest_cache/
+# superharness ralph runtime state (per-task tracking + retry)
+.claude/superharness/ralph/
+# superharness brainstorm mind-map session state (transient)
+.claude/superharness/brainstorm/
+# superharness brainstorm mind-map session state (transient)
+.superharness/

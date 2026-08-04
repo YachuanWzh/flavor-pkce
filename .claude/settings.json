@@ -1,0 +1,13 @@
+{
+    "extraKnownMarketplaces":  {
+                                   "superharness":  {
+                                                        "source":  {
+                                                                       "source":  "directory",
+                                                                       "path":  ".claude/superharness"
+                                                                   }
+                                                    }
+                               },
+    "enabledPlugins":  {
+                           "superharness@superharness":  true
+                       }
+}
