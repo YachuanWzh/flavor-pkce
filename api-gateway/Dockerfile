@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir \
     "prometheus-client>=0.21.0"
 
 COPY api-gateway/gateway/ ./gateway/
+COPY scripts/backup.py ./scripts/backup.py
 
 RUN mkdir -p /app/keys /app/data
 
