@@ -191,10 +191,13 @@ def setup_db():
     fd, tmp = tempfile.mkstemp(suffix=".db", prefix="audit_api_test_")
     os.close(fd)
     old = config.AUDIT_DB_PATH
+    old_token = config.AUDIT_API_TOKEN
     config.AUDIT_DB_PATH = tmp
+    config.AUDIT_API_TOKEN = "test-audit-token"
     init_audit_db()
     yield
     config.AUDIT_DB_PATH = old
+    config.AUDIT_API_TOKEN = old_token
     if os.path.exists(tmp):
         os.remove(tmp)
 
@@ -225,11 +228,18 @@ def client():
     return TestClient(app)
 
 
+class _AuthedClient(TestClient):
+    """TestClient that sends the audit token on /api/logs calls."""
+
+
 class TestAuditAPI:
     """Integration tests for GET /api/logs and GET /audit."""
 
+    def _headers(self):
+        return {"X-Audit-Token": "test-audit-token"}
+
     def test_api_logs_empty(self, client):
-        resp = client.get("/api/logs")
+        resp = client.get("/api/logs", headers=self._headers())
         assert resp.status_code == 200
         data = resp.json()
         assert data["total"] == 0
@@ -242,7 +252,7 @@ class TestAuditAPI:
         # Make another request that we can see in the logs
         client.get("/v1/chat/completions")
 
-        resp = client.get("/api/logs")
+        resp = client.get("/api/logs", headers=self._headers())
         assert resp.status_code == 200
         data = resp.json()
         assert data["total"] >= 2
@@ -253,7 +263,7 @@ class TestAuditAPI:
         for _ in range(5):
             client.get("/v1/models")
 
-        resp = client.get("/api/logs?page_size=2")
+        resp = client.get("/api/logs?page_size=2", headers=self._headers())
         data = resp.json()
         assert len(data["items"]) <= 2
         assert data["page_size"] == 2
@@ -263,7 +273,7 @@ class TestAuditAPI:
         client.get("/v1/chat/completions")
         client.get("/v1/models")
 
-        resp = client.get("/api/logs?keyword=chat")
+        resp = client.get("/api/logs?keyword=chat", headers=self._headers())
         data = resp.json()
         for item in data["items"]:
             has_match = ("chat" in item["path"].lower()) or ("chat" in item["user"].lower())
@@ -274,7 +284,7 @@ class TestAuditAPI:
         client.get("/v1/models")
 
         # Future date — no results
-        resp = client.get("/api/logs?start_date=2099-01-01")
+        resp = client.get("/api/logs?start_date=2099-01-01", headers=self._headers())
         data = resp.json()
         assert data["total"] == 0
 
@@ -282,7 +292,7 @@ class TestAuditAPI:
         """User filter should work via API."""
         client.get("/v1/models")  # unauthenticated, user="-"
 
-        resp = client.get("/api/logs?user=-")
+        resp = client.get("/api/logs?user=-", headers=self._headers())
         data = resp.json()
         assert data["total"] >= 1
 
@@ -296,10 +306,10 @@ class TestAuditAPI:
     def test_logs_not_auto_logged(self, client):
         """Requests to /api/logs and /metrics should not be persisted to DB."""
         # Make a few self-referencing calls
-        client.get("/api/logs")
+        client.get("/api/logs", headers=self._headers())
         client.get("/metrics")
 
-        resp = client.get("/api/logs")
+        resp = client.get("/api/logs", headers=self._headers())
         data = resp.json()
         # None of the logged items should have path /api/logs or /metrics
         for item in data["items"]:
@@ -312,24 +322,24 @@ class TestAuditAPI:
             client.get("/v1/models")
 
         # Verify they exist
-        before = client.get("/api/logs").json()
+        before = client.get("/api/logs", headers=self._headers()).json()
         assert before["total"] >= 3
 
         # Clear
-        resp = client.delete("/api/logs")
+        resp = client.delete("/api/logs", headers=self._headers())
         assert resp.status_code == 200
         data = resp.json()
         assert data["deleted"] >= 3
 
         # Verify empty
-        after = client.get("/api/logs").json()
+        after = client.get("/api/logs", headers=self._headers()).json()
         assert after["total"] == 0
 
     def test_token_columns_in_api_response(self, client):
         """The /api/logs response should include token and model fields."""
         client.get("/v1/models")
 
-        resp = client.get("/api/logs")
+        resp = client.get("/api/logs", headers=self._headers())
         data = resp.json()
         assert len(data["items"]) > 0
         item = data["items"][0]
@@ -375,7 +385,7 @@ class TestAuditAPI:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-            resp = client.get("/api/logs")
+            resp = client.get("/api/logs", headers=self._headers())
             data = resp.json()
             models = {item.get("model") for item in data["items"]}
             assert "deepseek-v4-pro" in models
@@ -424,7 +434,7 @@ class TestAuditAPI:
                 "Authorization": f"Bearer {token_str}",
             })
 
-            resp = client.get("/api/logs")
+            resp = client.get("/api/logs", headers=self._headers())
             data = resp.json()
             usernames = {item["user"] for item in data["items"]}
             assert "real-human-name" in usernames

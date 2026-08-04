@@ -12,10 +12,11 @@ tokens arrive too late for synchronous capture.
 """
 
 import json as _json
+import secrets
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 import httpx
 import jwt as pyjwt
@@ -24,7 +25,9 @@ from cryptography.hazmat.backends import default_backend
 from prometheus_client import generate_latest, REGISTRY
 
 import gateway.config
-from gateway.database import init_audit_db, query_logs, query_log_by_id, clear_logs
+from gateway.database import (
+    init_audit_db, query_logs, query_log_by_id, clear_logs, verify_integrity,
+)
 from gateway.logging import setup_logging, log_request
 from gateway.metrics import (
     REQUEST_COUNT,
@@ -186,8 +189,29 @@ def metrics():
 # Audit-log API
 # ---------------------------------------------------------------------------
 
+def _require_audit_token(request: Request) -> None:
+    """Gate the audit data API behind a shared secret (P0-1).
+
+    When no token is configured, the API refuses access entirely
+    (fail-closed for audit data).
+    """
+    configured = gateway.config.AUDIT_API_TOKEN
+    if not configured:
+        raise HTTPException(
+            status_code=401,
+            detail="Audit API is not enabled (set AUDIT_API_TOKEN)",
+        )
+    supplied = request.headers.get("x-audit-token", "")
+    if not secrets.compare_digest(supplied, configured):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid audit token",
+        )
+
+
 @app.get("/api/logs")
 def api_logs(
+    request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     start_date: str | None = Query(None),
@@ -196,6 +220,7 @@ def api_logs(
     user: str | None = Query(None),
 ):
     """Paginated audit-log query with optional filters."""
+    _require_audit_token(request)
     return query_logs({
         "page": page,
         "page_size": page_size,
@@ -206,9 +231,17 @@ def api_logs(
     })
 
 
+@app.get("/api/logs/integrity")
+def api_logs_integrity(request: Request):
+    """Report whether the hash chain verifies (tamper detection)."""
+    _require_audit_token(request)
+    return {"valid": verify_integrity()}
+
+
 @app.get("/api/logs/{log_id}")
-def api_log_detail(log_id: int):
+def api_log_detail(request: Request, log_id: int):
     """Return a single audit-log entry including request/response bodies."""
+    _require_audit_token(request)
     row = query_log_by_id(log_id)
     if row is None:
         return JSONResponse(status_code=404, content={"error": "Log not found"})
@@ -216,8 +249,9 @@ def api_log_detail(log_id: int):
 
 
 @app.delete("/api/logs")
-def api_clear_logs():
+def api_clear_logs(request: Request):
     """Clear all audit log entries."""
+    _require_audit_token(request)
     count = clear_logs()
     return {"deleted": count}
 

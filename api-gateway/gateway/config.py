@@ -37,6 +37,10 @@ ROUTING_CACHE_TTL_SECONDS = int(os.environ.get("ROUTING_CACHE_TTL_SECONDS", "0")
 # 0 disables caching (every request checks with the auth server).
 REVOCATION_CACHE_TTL_SECONDS = int(os.environ.get("REVOCATION_CACHE_TTL_SECONDS", "5"))
 
+# Bearer token required for the audit-log API (P0-1). When empty, all
+# /api/logs* endpoints refuse access (fail-closed for audit data).
+AUDIT_API_TOKEN = os.environ.get("AUDIT_API_TOKEN", "")
+
 # Gateway settings
 HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("GATEWAY_PORT", "8092"))
