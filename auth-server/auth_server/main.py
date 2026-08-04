@@ -24,6 +24,7 @@ from auth_server.ratelimit import (
     record_attempt, is_rate_limited,
     record_failure, is_locked, reset_failures,
 )
+from auth_server.audit import log_event, purge_old_audit_logs
 from auth_server.llm_config import get_llm_config, save_llm_config
 import auth_server.config as server_config
 from auth_server.config import (
@@ -37,6 +38,7 @@ from auth_server.jwt_utils import create_jwt, get_jwt_payload
 async def lifespan(app: FastAPI):
     server_config.validate_production_config()  # P0-8: fail fast on weak defaults
     init_db()
+    purge_old_audit_logs()  # P0-10: enforce retention on startup
     yield
 
 
@@ -369,6 +371,7 @@ def register(body: RegisterRequest, request: Request):
         samesite="lax",
         secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
     )
+    log_event(request, "register", actor_user_id=user_id, actor_username=body.username)
     return resp
 
 
@@ -417,9 +420,16 @@ def login(
             max_failures=server_config.LOGIN_MAX_FAILURES,
             lock_seconds=server_config.LOGIN_LOCK_SECONDS,
         )
+        log_event(
+            request, "login.failed",
+            actor_user_id=user["id"] if user else None,
+            actor_username=username,
+            detail={"reason": "invalid_credentials"},
+        )
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     reset_failures(acct_key)
+    log_event(request, "login.success", actor_user_id=user["id"], actor_username=user["username"])
 
     session_token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(days=3)
@@ -708,6 +718,13 @@ def token(
     db.commit()
     db.close()
 
+    log_event(
+        request, "token.exchange",
+        actor_user_id=auth_code["user_id"],
+        actor_username=username,
+        detail={"client_id": client_id, "grant_type": "authorization_code"},
+    )
+
     # Clear pending auth from session
     return JSONResponse(content={
         "access_token": access_token,
@@ -865,6 +882,13 @@ def refresh(
     db.commit()
     db.close()
 
+    log_event(
+        request, "refresh",
+        actor_user_id=row["user_id"],
+        actor_username=username,
+        detail={"client_id": client_id},
+    )
+
     llm_config = get_llm_config(row["user_id"])
     return JSONResponse(content={
         "access_token": access_token,
@@ -915,6 +939,10 @@ def revoke(
         db.execute("UPDATE tokens SET revoked = 1 WHERE jti = ?", (candidate,))
     db.commit()
     db.close()
+    log_event(
+        request, "revoke",
+        detail={"client_id": client_id, "token_type_hint": token_type_hint},
+    )
     return JSONResponse(content={})
 
 

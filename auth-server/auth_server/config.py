@@ -35,6 +35,9 @@ TOKEN_RATE_WINDOW = int(os.environ.get("TOKEN_RATE_WINDOW", "60"))
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
 ENABLE_HSTS = os.environ.get("ENABLE_HSTS", "false").lower() == "true"
 
+# Audit retention (P0-10): how many days to keep auth audit events.
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "180"))
+
 # Startup safety (P0-8)
 SEED_TEST_USER = os.environ.get("SEED_TEST_USER", "false").lower() == "true"
 ALLOW_INSECURE_DEFAULTS = (

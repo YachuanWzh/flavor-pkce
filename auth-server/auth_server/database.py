@@ -199,6 +199,19 @@ def init_db() -> None:
             locked_until  REAL NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            event          TEXT NOT NULL,
+            actor_user_id  TEXT,
+            actor_username TEXT,
+            ip             TEXT,
+            user_agent     TEXT,
+            detail         TEXT NOT NULL DEFAULT '{}',
+            created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
+
         CREATE INDEX IF NOT EXISTS idx_auth_codes_expires ON authorization_codes(expires_at);
         CREATE INDEX IF NOT EXISTS idx_tokens_jti ON tokens(jti);
     """)
