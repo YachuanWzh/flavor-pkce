@@ -18,6 +18,16 @@ AUTH_PORT = int(os.environ.get("AUTH_PORT", "8091"))
 # Password strength policy (P0-9)
 PASSWORD_MIN_LENGTH = int(os.environ.get("PASSWORD_MIN_LENGTH", "8"))
 
+# Rate limiting / brute-force protection (P0-4)
+LOGIN_RATE_LIMIT = int(os.environ.get("LOGIN_RATE_LIMIT", "20"))       # per IP
+LOGIN_RATE_WINDOW = int(os.environ.get("LOGIN_RATE_WINDOW", "60"))     # seconds
+LOGIN_MAX_FAILURES = int(os.environ.get("LOGIN_MAX_FAILURES", "5"))    # per account
+LOGIN_LOCK_SECONDS = int(os.environ.get("LOGIN_LOCK_SECONDS", "300"))  # lockout
+REGISTER_RATE_LIMIT = int(os.environ.get("REGISTER_RATE_LIMIT", "10"))
+REGISTER_RATE_WINDOW = int(os.environ.get("REGISTER_RATE_WINDOW", "60"))
+TOKEN_RATE_LIMIT = int(os.environ.get("TOKEN_RATE_LIMIT", "60"))
+TOKEN_RATE_WINDOW = int(os.environ.get("TOKEN_RATE_WINDOW", "60"))
+
 # Public gateway metadata and private gateway-to-auth credential.
 PUBLIC_GATEWAY_URL = os.environ.get("PUBLIC_GATEWAY_URL", "http://127.0.0.1:8092")
 INTERNAL_SERVICE_TOKEN = os.environ.get("INTERNAL_SERVICE_TOKEN", "dev-internal-token-change-me")

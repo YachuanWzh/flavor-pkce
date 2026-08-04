@@ -187,6 +187,18 @@ def init_db() -> None:
             created_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            key           TEXT PRIMARY KEY,
+            window_start  INTEGER NOT NULL,
+            hits          INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS login_failures (
+            key           TEXT PRIMARY KEY,
+            failures      INTEGER NOT NULL DEFAULT 0,
+            locked_until  REAL NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_auth_codes_expires ON authorization_codes(expires_at);
         CREATE INDEX IF NOT EXISTS idx_tokens_jti ON tokens(jti);
     """)

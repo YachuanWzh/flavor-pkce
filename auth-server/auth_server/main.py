@@ -20,6 +20,10 @@ from auth_server.database import (
     create_session, get_session, delete_session,
     set_pending_auth, get_pending_auth, clear_pending_auth,
 )
+from auth_server.ratelimit import (
+    record_attempt, is_rate_limited,
+    record_failure, is_locked, reset_failures,
+)
 from auth_server.llm_config import get_llm_config, save_llm_config
 import auth_server.config as server_config
 from auth_server.config import AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN, CORS_ORIGINS, FRONTEND_DIST_PATH
@@ -284,8 +288,21 @@ def generate_auth_code() -> str:
 # ---------- Routes ----------
 
 @app.post("/register", status_code=201)
-def register(body: RegisterRequest):
+def register(body: RegisterRequest, request: Request):
     """Register a new user."""
+    ip = request.client.host if request.client else "unknown"
+    ip_key = f"register:ip:{ip}"
+    record_attempt(ip_key, window_seconds=server_config.REGISTER_RATE_WINDOW)
+    if is_rate_limited(
+        ip_key,
+        limit=server_config.REGISTER_RATE_LIMIT,
+        window_seconds=server_config.REGISTER_RATE_WINDOW,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many registration attempts from this address",
+        )
+
     db = get_db()
     cursor = db.cursor()
 
@@ -328,11 +345,34 @@ def register(body: RegisterRequest):
 
 @app.post("/login")
 def login(
+    request: Request,
     username: str = Form(...),
     password: str = Form(...),
     return_url: str = Form(""),
 ):
     """Authenticate a user and return a session token."""
+    ip = request.client.host if request.client else "unknown"
+
+    # IP-level rate limit
+    ip_key = f"login:ip:{ip}"
+    record_attempt(ip_key, window_seconds=server_config.LOGIN_RATE_WINDOW)
+    if is_rate_limited(
+        ip_key,
+        limit=server_config.LOGIN_RATE_LIMIT,
+        window_seconds=server_config.LOGIN_RATE_WINDOW,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts from this address",
+        )
+
+    # Account-level lockout after repeated failures
+    acct_key = f"login:user:{username}"
+    if is_locked(acct_key):
+        raise HTTPException(
+            status_code=429,
+            detail="Account temporarily locked due to repeated failed attempts",
+        )
 
     db = get_db()
     cursor = db.cursor()
@@ -343,7 +383,14 @@ def login(
     db.close()
 
     if not user or not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+        record_failure(
+            acct_key,
+            max_failures=server_config.LOGIN_MAX_FAILURES,
+            lock_seconds=server_config.LOGIN_LOCK_SECONDS,
+        )
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    reset_failures(acct_key)
 
     session_token = secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(days=3)
@@ -490,6 +537,7 @@ def consent_confirm(request: Request):
 
 @app.post("/token")
 def token(
+    request: Request,
     grant_type: str = Form(...),
     code: str = Form(...),
     redirect_uri: str = Form(...),
@@ -497,6 +545,19 @@ def token(
     code_verifier: str = Form(...),
 ):
     """PKCE /token endpoint — validate code_verifier and issue JWT."""
+    ip = request.client.host if request.client else "unknown"
+    ip_key = f"token:ip:{ip}"
+    record_attempt(ip_key, window_seconds=server_config.TOKEN_RATE_WINDOW)
+    if is_rate_limited(
+        ip_key,
+        limit=server_config.TOKEN_RATE_LIMIT,
+        window_seconds=server_config.TOKEN_RATE_WINDOW,
+    ):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate_limited", "error_description": "Too many token requests"},
+        )
+
     if grant_type != "authorization_code":
         return JSONResponse(
             status_code=400,
