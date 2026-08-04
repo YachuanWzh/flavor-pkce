@@ -38,6 +38,31 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="PKCE Authorization Server", lifespan=lifespan)
 
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Apply security headers to every response (P0-6).
+
+    X-Frame-Options: DENY protects the consent/login pages from clickjacking.
+    CSP restricts script/style sources; style 'unsafe-inline' is required by
+    the served SPA's inline styles.
+    """
+    response = await call_next(request)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; "
+        "style-src 'self' 'unsafe-inline'; script-src 'self'",
+    )
+    if server_config.ENABLE_HSTS:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    return response
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -338,7 +363,7 @@ def register(body: RegisterRequest, request: Request):
         httponly=True,
         max_age=259200,
         samesite="lax",
-        secure=False,  # Set True in production with HTTPS
+        secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
     )
     return resp
 
@@ -406,7 +431,7 @@ def login(
             httponly=True,
             max_age=259200,
             samesite="lax",
-            secure=False,  # Set True in production with HTTPS
+            secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
         )
         return resp
 
@@ -419,7 +444,7 @@ def login(
         httponly=True,
         max_age=259200,
         samesite="lax",
-        secure=False,  # Set True in production with HTTPS
+        secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
     )
     return resp
 

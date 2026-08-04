@@ -28,6 +28,10 @@ REGISTER_RATE_WINDOW = int(os.environ.get("REGISTER_RATE_WINDOW", "60"))
 TOKEN_RATE_LIMIT = int(os.environ.get("TOKEN_RATE_LIMIT", "60"))
 TOKEN_RATE_WINDOW = int(os.environ.get("TOKEN_RATE_WINDOW", "60"))
 
+# Security headers / cookie hardening (P0-6). Production sets both to true.
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
+ENABLE_HSTS = os.environ.get("ENABLE_HSTS", "false").lower() == "true"
+
 # Public gateway metadata and private gateway-to-auth credential.
 PUBLIC_GATEWAY_URL = os.environ.get("PUBLIC_GATEWAY_URL", "http://127.0.0.1:8092")
 INTERNAL_SERVICE_TOKEN = os.environ.get("INTERNAL_SERVICE_TOKEN", "dev-internal-token-change-me")
