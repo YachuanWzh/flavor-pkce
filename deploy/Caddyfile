@@ -3,7 +3,7 @@
 #
 # SSO 拓扑：auth 与 gateway 共用同一域名，用路径区分：
 #   https://<PUBLIC_DOMAIN>/        → auth-server（SPA + OAuth 端点）
-#   https://<PUBLIC_DOMAIN>/gw/*    → api-gateway（/v1/*、/audit、/api/logs、/health、/metrics）
+#   https://<PUBLIC_DOMAIN>/gw/*    → api-gateway（/v1/*、/audit、/report、/api/logs、/api/stats、/health、/metrics）
 # 这样 auth-server 登录时设置的 access_token HttpOnly cookie 属于同一域名，
 # 浏览器访问 /gw/audit 时自动携带，实现真正的单点登录。
 

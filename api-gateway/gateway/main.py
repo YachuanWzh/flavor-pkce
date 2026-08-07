@@ -5,10 +5,11 @@ Every request is logged as a single JSON line and tracked via Prometheus
 metrics exposed at ``/metrics``.  Audit logs are persisted to SQLite and
 browsable at ``/audit``.
 
-Token usage (prompt_tokens / completion_tokens) is extracted from both
-non-streaming and streaming responses.  For Anthropic SSE streams the
-``input_tokens`` are captured from the ``message_start`` event; output
-tokens arrive too late for synchronous capture.
+Token usage (prompt / completion tokens and provider prompt-cache
+breakdowns) is extracted from both non-streaming and streaming
+responses.  For SSE streams the full usage is recovered from the
+buffered body once the stream is drained (Anthropic ``message_start``
+/ ``message_delta``; OpenAI final usage chunk).
 """
 
 import json as _json
@@ -87,10 +88,13 @@ async def _is_jti_revoked(jti: str) -> bool:
     return revoked
 
 # Path prefixes that the observability middleware should NOT audit-log.
-_AUDIT_SKIP_PREFIXES = ("/metrics", "/api/logs", "/health")
+_AUDIT_SKIP_PREFIXES = ("/metrics", "/api/logs", "/api/stats", "/health", "/report")
 
 # Path to the static audit-viewer HTML page.
 _AUDIT_HTML_PATH = Path(__file__).parent / "web" / "logs.html"
+
+# Path to the static usage-report HTML page.
+_REPORT_HTML_PATH = Path(__file__).parent / "web" / "report.html"
 
 
 def load_public_key():
@@ -326,6 +330,70 @@ def audit_page():
     return FileResponse(_AUDIT_HTML_PATH, media_type="text/html; charset=utf-8")
 
 
+@app.get("/report")
+def report_page():
+    """Serve the usage-report dashboard HTML page."""
+    return FileResponse(_REPORT_HTML_PATH, media_type="text/html; charset=utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Report (stats) API — aggregates for the dashboard
+# ---------------------------------------------------------------------------
+
+@app.get("/api/stats/tokens")
+def api_stats_tokens(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+    group_by: str | None = Query(None),
+):
+    """Daily token usage, optionally grouped by user / model / service."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.token_usage(start_date, end_date, user, group_by)}
+
+
+@app.get("/api/stats/cache")
+def api_stats_cache(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+):
+    """Daily prompt-cache token usage and hit ratio."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.cache_usage(start_date, end_date, user)}
+
+
+@app.get("/api/stats/requests")
+def api_stats_requests(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+):
+    """Daily request volume, errors and average latency."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.request_stats(start_date, end_date, user)}
+
+
+@app.get("/api/stats/models")
+def api_stats_models(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Top models ranked by total token consumption."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.top_models(start_date, end_date, user, limit)}
+
+
 # ---------------------------------------------------------------------------
 # Middleware: logging + metrics for every request
 # ---------------------------------------------------------------------------
@@ -365,7 +433,11 @@ async def log_metrics_middleware(request: Request, call_next):
             upstream_ms = getattr(request.state, "upstream_ms", None)
             prompt_tokens = getattr(request.state, "prompt_tokens", None)
             completion_tokens = getattr(request.state, "completion_tokens", None)
+            cache_read_tokens = getattr(request.state, "cache_read_tokens", None)
+            cache_creation_tokens = getattr(request.state, "cache_creation_tokens", None)
             model = getattr(request.state, "model", None)
+            service_name = getattr(request.state, "service_name", None)
+            user_id = getattr(request.state, "user_id", None)
             request_body = getattr(request.state, "request_body", None)
             response_body = getattr(request.state, "response_body", None)
             level = "ERROR" if status_code >= 500 else "INFO"
@@ -380,8 +452,12 @@ async def log_metrics_middleware(request: Request, call_next):
                 level=level,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_creation_tokens=cache_creation_tokens,
                 model=model,
+                service_name=service_name,
                 session_id=session_id,
+                user_id=user_id,
                 request_body=request_body,
                 response_body=response_body,
             )
@@ -431,6 +507,8 @@ async def proxy(request: Request, path: str):
     # Human-readable username comes from the JWT 'username' claim (added
     # by the auth server).  Older tokens only have 'sub' (a UUID).
     request.state.user_sub = payload.get("username") or payload.get("sub", "-")
+    # Stable identifier for cross-system joins (auth-server users.id).
+    request.state.user_id = payload.get("sub") or None
 
     # Session identifier: prefer the JWT 'jti' (JWT ID) claim; fall back
     # to 'sid' (session ID) or generate one from sub + current time.
@@ -537,7 +615,10 @@ async def proxy(request: Request, path: str):
                     # Finalise audit state after the stream is drained.
                     combined = b"".join(collected)
                     request.state.response_body = _decode_body(combined)
-                    request.state.completion_tokens = None  # arrives too late
+                    # Usage events arrive late in the stream (Anthropic
+                    # message_delta / OpenAI final usage chunk); recover
+                    # them from the full buffered body now.
+                    _extract_usage_from_stream(request, combined)
                     request.state.upstream_ms = (
                         (time.perf_counter() - upstream_start) * 1000
                     )
@@ -635,7 +716,10 @@ def _extract_full_token_usage(request: Request, body: bytes) -> None:
     """Parse an upstream LLM JSON response for token usage.
 
     Handles OpenAI (usage.prompt_tokens/completion_tokens) and Anthropic
-    (usage.input_tokens/output_tokens) formats.
+    (usage.input_tokens/output_tokens) formats, plus provider prompt-cache
+    breakdowns (Anthropic ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``; OpenAI
+    ``input_tokens_details.cached_tokens``).
     """
     usage = _parse_usage_json(body)
     request.state.prompt_tokens = _int_or_none(
@@ -644,6 +728,72 @@ def _extract_full_token_usage(request: Request, body: bytes) -> None:
     request.state.completion_tokens = _int_or_none(
         usage, "completion_tokens", "output_tokens",
     )
+    request.state.cache_read_tokens = _cache_read_from_usage(usage)
+    request.state.cache_creation_tokens = _int_or_none(
+        usage, "cache_creation_input_tokens",
+    )
+
+
+def _cache_read_from_usage(usage: dict) -> int | None:
+    """Extract cache-read tokens from a usage object (any provider)."""
+    direct = _int_or_none(usage, "cache_read_input_tokens")
+    if direct is not None:
+        return direct
+    details = usage.get("input_tokens_details")
+    if isinstance(details, dict):
+        return _int_or_none(details, "cached_tokens")
+    return None
+
+
+def _extract_usage_from_stream(request: Request, body: bytes) -> None:
+    """Recover full token usage from a collected SSE stream body.
+
+    Streaming responses deliver usage in late events (Anthropic
+    ``message_start`` for input tokens, ``message_delta`` for output
+    tokens; OpenAI emits a final chunk with a complete ``usage`` object
+    when usage reporting is enabled).  By the time this runs the entire
+    stream has been buffered, so every ``data:`` frame is parsed and the
+    usage fields merged together.  Fields that never appear stay ``None``.
+    """
+    text = body.decode("utf-8", errors="replace")
+    prompt = None
+    completion = None
+    cache_read = None
+    cache_creation = None
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped.startswith("data:"):
+            continue
+        payload = stripped[5:].strip()
+        if payload in ("", "[DONE]"):
+            continue
+        try:
+            obj = _json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        usage = obj.get("usage")
+        if obj.get("type") == "message_start":
+            usage = obj.get("message", {}).get("usage")
+        if not isinstance(usage, dict):
+            continue
+        value = _int_or_none(usage, "prompt_tokens", "input_tokens")
+        if value is not None:
+            prompt = value
+        value = _int_or_none(usage, "completion_tokens", "output_tokens")
+        if value is not None:
+            completion = value
+        value = _cache_read_from_usage(usage)
+        if value is not None:
+            cache_read = value
+        value = _int_or_none(usage, "cache_creation_input_tokens")
+        if value is not None:
+            cache_creation = value
+    request.state.prompt_tokens = prompt
+    request.state.completion_tokens = completion
+    request.state.cache_read_tokens = cache_read
+    request.state.cache_creation_tokens = cache_creation
 
 
 def _extract_input_tokens_from_chunk(chunk: bytes) -> int | None:

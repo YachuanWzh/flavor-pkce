@@ -26,6 +26,8 @@ setup_ssh.py
 frontend/dist/
 auth-server/.pytest_cache/
 api-gateway/.pytest_cache/
+# Transient smoke-test log held open while the dev gateway runs
+api-gateway/smoke_gw.log
 .pytest_cache/
 # superharness ralph runtime state (per-task tracking + retry)
 .claude/superharness/ralph/

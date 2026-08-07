@@ -37,7 +37,7 @@ docker compose -f deploy/docker-compose.prod.yml logs -f
 | 默认密钥 fail-fast | `AUTH_SECRET_KEY`/`INTERNAL_SERVICE_TOKEN` 缺失或为默认值 → auth-server 拒绝启动 |
 | secure cookie / HSTS | `COOKIE_SECURE=true`、`ENABLE_HSTS=true`，Caddy 下发 HSTS 头 |
 | 无种子账号 | `SEED_TEST_USER=false`（生产绝不创建 testuser） |
-| 审计 API 鉴权 | `AUDIT_API_TOKEN` 必填，`/api/logs*` 未带 token 一律 401 |
+| 审计 API 鉴权 | `AUDIT_API_TOKEN` 必填，`/api/logs*` 与 `/api/stats*` 未带 token 一律 401；管理员 JWT（SSO）可直接访问 `/gw/audit`、`/gw/report` |
 | SSRF 防护 | 用户配置的上游地址只允许公网 http(s)（私网/元数据/环回被拒） |
 | 令牌撤销 | 网关每次请求向 auth 检查 jti 撤销（可配置短缓存） |
 | 审计留存 | `AUDIT_RETENTION_DAYS=180`，启动时清理过期日志 |
