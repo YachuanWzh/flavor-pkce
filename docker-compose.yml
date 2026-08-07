@@ -18,6 +18,8 @@ services:
       - CORS_ORIGINS=http://192.168.5.7:8091,http://localhost:5174,http://localhost:8091
       - PUBLIC_GATEWAY_URL=${PUBLIC_GATEWAY_URL:-http://127.0.0.1:8092}
       - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN:-dev-internal-token-change-me}
+      # P0-8: 本地开发专用,允许内置开发密钥;生产请用 deploy/docker-compose.prod.yml
+      - ALLOW_INSECURE_DEFAULTS=true
       - ADMIN_USERNAME=${ADMIN_USERNAME}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - LLM_CONFIG_ENCRYPTION_KEY_PATH=/app/keys/llm-config.key
@@ -52,6 +54,7 @@ services:
       - UPSTREAM_URL=${UPSTREAM_URL}
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY}
       - UPSTREAM_AUTH_TYPE=${UPSTREAM_AUTH_TYPE:-x-api-key}
+      - UPSTREAM_URL_ALLOWLIST=${UPSTREAM_URL_ALLOWLIST:-}
       - AUTH_SERVER_INTERNAL_URL=http://auth-server:8091
       - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN:-dev-internal-token-change-me}
       - GATEWAY_HOST=0.0.0.0

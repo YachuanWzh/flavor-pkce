@@ -163,8 +163,12 @@ async def _resolve_user_routing(payload: dict) -> tuple[dict | None, JSONRespons
         return None, JSONResponse(status_code=502, content={"error": "Invalid routing response"})
 
     # SSRF guard (P0-7): refuse to proxy to private/metadata/loopback targets,
-    # even when the user controls their own upstream_url.
-    if not validate_upstream_url(str(routing.get("upstream_url", ""))):
+    # even when the user controls their own upstream_url. Operator-approved
+    # hosts (UPSTREAM_URL_ALLOWLIST) bypass the check.
+    if not validate_upstream_url(
+        str(routing.get("upstream_url", "")),
+        gateway.config.UPSTREAM_URL_ALLOWLIST,
+    ):
         return None, JSONResponse(
             status_code=400,
             content={
@@ -202,17 +206,63 @@ def metrics():
 # Audit-log API
 # ---------------------------------------------------------------------------
 
-def _require_audit_token(request: Request) -> None:
-    """Gate the audit data API behind a shared secret (P0-1).
+def _extract_jwt_from_request(request: Request) -> str | None:
+    """Extract a JWT from the Authorization header or x-api-key header."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:]
+    return request.headers.get("x-api-key") or None
 
-    When no token is configured, the API refuses access entirely
-    (fail-closed for audit data).
+
+def _require_admin(request: Request) -> dict:
+    """Require a valid JWT whose role claim is 'admin'.
+
+    This is the primary gate for the audit-log API.  It returns the
+    verified payload so callers can attribute the action.
     """
+    token = _extract_jwt_from_request(request)
+    payload = verify_jwt(token) if token else None
+    if payload is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+        )
+    if payload.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Administrator access required",
+        )
+    return payload
+
+
+def _require_audit_token(request: Request) -> dict:
+    """Gate the audit data API behind admin JWT or the legacy shared secret (P0-1).
+
+    Primary auth: a signed JWT with role=admin, supplied either via the
+    ``Authorization: Bearer`` header (scripts/SPA) or the ``access_token``
+    HttpOnly cookie set by the auth server on login (SSO in the browser).
+    Legacy fallback: the operator-configured AUDIT_API_TOKEN via the
+    ``x-audit-token`` header. When no credential matches, the API is
+    fail-closed (401/403).
+    """
+    token = _extract_jwt_from_request(request)
+    if not token:
+        token = request.cookies.get("access_token", "")
+    if token:
+        payload = verify_jwt(token)
+        if payload is not None:
+            if payload.get("role") == "admin":
+                return payload
+            raise HTTPException(
+                status_code=403,
+                detail="Administrator access required",
+            )
+
     configured = gateway.config.AUDIT_API_TOKEN
     if not configured:
         raise HTTPException(
             status_code=401,
-            detail="Audit API is not enabled (set AUDIT_API_TOKEN)",
+            detail="Authentication required",
         )
     supplied = request.headers.get("x-audit-token", "")
     if not secrets.compare_digest(supplied, configured):
@@ -220,6 +270,7 @@ def _require_audit_token(request: Request) -> None:
             status_code=401,
             detail="Invalid audit token",
         )
+    return {"role": "admin"}
 
 
 @app.get("/api/logs")
@@ -399,7 +450,10 @@ async def proxy(request: Request, path: str):
     # cannot target private/metadata addresses. The legacy fallback upstream
     # is operator-configured (UPSTREAM_URL env) and is trusted, so it is exempt.
     if routing.get("service_name") != "legacy-upstream":
-        if not validate_upstream_url(str(routing.get("upstream_url", ""))):
+        if not validate_upstream_url(
+            str(routing.get("upstream_url", "")),
+            gateway.config.UPSTREAM_URL_ALLOWLIST,
+        ):
             return JSONResponse(
                 status_code=400,
                 content={

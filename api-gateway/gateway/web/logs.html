@@ -276,7 +276,9 @@
 </div>
 
 <script>
-const API = '/api/logs';
+// Relative path: works both at /audit (dev) and /gw/audit (prod SSO),
+// because the browser resolves it against the current page's directory.
+const API = '../api/logs';
 let autoRefresh = false;
 let refreshTimer = null;
 
@@ -288,6 +290,30 @@ function statusClass(s) {
   if (s >= 400) return 'status-4xx';
   if (s >= 200) return 'status-2xx';
   return '';
+}
+
+// ---- SSO auth ----
+// The audit API requires a signed JWT with role=admin. In production the
+// token lives in an HttpOnly cookie (set by the auth server under the shared
+// domain); in development it may be stored in localStorage by the SPA.
+function getAccessToken() {
+  // 1) HttpOnly cookie (SSO): same-origin cookie auto-sent; parse it here
+  //    so we can also pass it explicitly as a Bearer header.
+  const m = document.cookie.match(/(?:^|;\s*)access_token=([^;]+)/);
+  if (m) return decodeURIComponent(m[1]);
+  // 2) localStorage fallback (dev)
+  try {
+    return localStorage.getItem('access_token') || '';
+  } catch {
+    return '';
+  }
+}
+
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  const token = getAccessToken();
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  return headers;
 }
 
 // ---- Fetch & Render ----
@@ -313,7 +339,9 @@ async function fetchLogs(page = 1) {
   $('pagBar').style.display = 'none';
 
   try {
-    const resp = await fetch(`${API}?${params}`);
+    const resp = await fetch(`${API}?${params}`, { headers: authHeaders() });
+    if (resp.status === 401) throw new Error('HTTP 401 — sign in as an administrator');
+    if (resp.status === 403) throw new Error('HTTP 403 — administrator access required');
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     render(data);
@@ -431,7 +459,7 @@ async function showDetail(logId, btn) {
   $('detailModal').classList.add('active');
 
   try {
-    const resp = await fetch(`/api/logs/${logId}`);
+    const resp = await fetch(`${API}/${logId}`, { headers: authHeaders() });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const row = await resp.json();
     renderDetail(row);
@@ -522,7 +550,7 @@ $('refreshBtn').addEventListener('click', toggleAutoRefresh);
 $('clearBtn').addEventListener('click', async () => {
   if (!confirm('Delete ALL audit log entries? This cannot be undone.')) return;
   try {
-    const resp = await fetch('/api/logs', { method: 'DELETE' });
+    const resp = await fetch(`${API}`, { method: 'DELETE', headers: authHeaders() });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     $('errorArea').innerHTML = '';

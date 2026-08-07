@@ -409,7 +409,7 @@ def login(
     db = get_db()
     cursor = db.cursor()
     user = cursor.execute(
-        "SELECT id, username, password_hash FROM users WHERE username = ?",
+        "SELECT id, username, password_hash, role FROM users WHERE username = ?",
         (username,)
     ).fetchone()
     db.close()
@@ -436,12 +436,32 @@ def login(
 
     create_session(session_token, user["id"], user["username"], expires_at.isoformat())
 
+    # SSO cookie: sign a short-lived JWT (with the user's role) so the same
+    # browser can authenticate to the API gateway (same domain in production)
+    # without typing a secret. HttpOnly + SameSite=Lax keeps it out of JS.
+    role = user["role"] if user["role"] else "user"
+    access_token = create_jwt(
+        sub=user["id"],
+        client_id="flavor-code-cli",
+        scope="",
+        username=user["username"],
+        role=role,
+    )
+
     # If this login was triggered from the authorize flow, redirect back
     if return_url:
         resp = RedirectResponse(url=return_url, status_code=302)
         resp.set_cookie(
             key="session_token",
             value=session_token,
+            httponly=True,
+            max_age=259200,
+            samesite="lax",
+            secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
+        )
+        resp.set_cookie(
+            key="access_token",
+            value=access_token,
             httponly=True,
             max_age=259200,
             samesite="lax",
@@ -455,6 +475,14 @@ def login(
     resp.set_cookie(
         key="session_token",
         value=session_token,
+        httponly=True,
+        max_age=259200,
+        samesite="lax",
+        secure=server_config.COOKIE_SECURE,  # True in production (HTTPS)
+    )
+    resp.set_cookie(
+        key="access_token",
+        value=access_token,
         httponly=True,
         max_age=259200,
         samesite="lax",
@@ -674,11 +702,13 @@ def token(
     # Mark code as used
     db.execute("UPDATE authorization_codes SET used = 1 WHERE code = ?", (code,))
 
-    # Resolve username for the JWT (so the gateway can log it)
+    # Resolve username + role for the JWT (so the gateway can log it and
+    # enforce admin-only routes).
     user_row = db.execute(
-        "SELECT username FROM users WHERE id = ?", (auth_code["user_id"],)
+        "SELECT username, role FROM users WHERE id = ?", (auth_code["user_id"],)
     ).fetchone()
     username = user_row["username"] if user_row else auth_code["user_id"]
+    role = user_row["role"] if user_row else "user"
 
     # Create JWT
     access_token = create_jwt(
@@ -687,6 +717,7 @@ def token(
         scope=auth_code["scope"] or "",
         username=username,
         config_version=llm_config["config_version"],
+        role=role,
     )
 
     # Decode JWT to get jti for token tracking
@@ -757,6 +788,7 @@ def _constant_time_compare(a: str, b: str) -> bool:
 
 def _issue_refresh_and_access(
     db, user_id: str, username: str, client_id: str, scope: str,
+    role: str = "user",
 ) -> tuple[str, str]:
     """Issue a fresh (access, refresh) token pair and record both rows.
 
@@ -774,6 +806,7 @@ def _issue_refresh_and_access(
         scope=scope,
         username=username,
         config_version=llm_config["config_version"],
+        role=role,
     )
     payload = get_jwt_payload(access_token)
     jti = payload["jti"] if payload else str(uuid.uuid4())
@@ -864,13 +897,15 @@ def refresh(
     db.execute("UPDATE tokens SET revoked = 1 WHERE jti = ?", (refresh_hash,))
 
     user_row = db.execute(
-        "SELECT username FROM users WHERE id = ?", (row["user_id"],)
+        "SELECT username, role FROM users WHERE id = ?", (row["user_id"],)
     ).fetchone()
     username = user_row["username"] if user_row else row["user_id"]
+    role = user_row["role"] if user_row else "user"
 
     try:
         access_token, new_refresh = _issue_refresh_and_access(
             db, row["user_id"], username, client_id, row["scope"] or "",
+            role=role,
         )
     except HTTPException:
         db.rollback()

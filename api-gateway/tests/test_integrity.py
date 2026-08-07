@@ -28,10 +28,53 @@ def setup_db():
             pass
 
 
+@pytest.fixture(autouse=True)
+def setup_keys():
+    """Point the gateway at the auth-server public key so JWT verification works."""
+    keys_dir = os.path.join(
+        os.path.dirname(__file__), "..", "..", "auth-server", "keys"
+    )
+    if not os.path.exists(keys_dir):
+        os.makedirs(keys_dir, exist_ok=True)
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "auth-server"))
+    from auth_server.jwt_utils import _ensure_keys_exist
+    _ensure_keys_exist()
+    old_path = config.JWT_PUBLIC_KEY_PATH
+    config.JWT_PUBLIC_KEY_PATH = os.path.join(keys_dir, "public.pem")
+    import gateway.main as gm
+    gm._public_key = None
+    yield
+    config.JWT_PUBLIC_KEY_PATH = old_path
+    gm._public_key = None
+
+
 @pytest.fixture
 def client():
     from gateway.main import app
     return TestClient(app)
+
+
+def _make_jwt(role: str, username: str = "admin") -> str:
+    """Sign a JWT with the auth-server private key for the given role."""
+    import time
+    import jwt as pyjwt
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+
+    private_key_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "auth-server", "keys", "private.pem"
+    )
+    with open(private_key_path, "rb") as f:
+        private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+
+    now = int(time.time())
+    payload = {
+        "sub": "u-admin", "username": username, "client_id": "flavor-code-cli",
+        "scope": "models:use", "role": role,
+        "iat": now, "exp": now + 3600, "jti": "admin-jti-1",
+    }
+    return pyjwt.encode(payload, private_key, algorithm="RS256")
 
 
 def _sample_log(user="alice"):
@@ -90,6 +133,57 @@ def test_insert_log_hashes_are_chained():
 def test_api_logs_requires_token(client):
     resp = client.get("/api/logs")
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Admin-JWT auth (SSO-style)
+# ---------------------------------------------------------------------------
+
+def test_api_logs_with_admin_jwt(client):
+    """A signed JWT with role=admin should be able to read audit logs."""
+    token = _make_jwt("admin")
+    resp = client.get("/api/logs", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 0
+
+
+def test_api_logs_rejects_non_admin_jwt(client):
+    """A signed JWT with role=user should be forbidden (403)."""
+    token = _make_jwt("user", username="alice")
+    resp = client.get("/api/logs", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 403
+
+
+def test_api_logs_rejects_invalid_jwt(client):
+    """A tampered/unsigned JWT should be rejected (401)."""
+    resp = client.get("/api/logs", headers={"Authorization": "Bearer not.a.jwt"})
+    assert resp.status_code == 401
+
+
+def test_delete_logs_with_admin_jwt(client):
+    """DELETE /api/logs should work with an admin JWT."""
+    _sample_log()
+    token = _make_jwt("admin")
+    resp = client.delete("/api/logs", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == 1
+
+
+def test_api_logs_with_admin_cookie(client):
+    """SSO: an admin JWT in the access_token HttpOnly cookie should work."""
+    token = _make_jwt("admin")
+    client.cookies.set("access_token", token)
+    resp = client.get("/api/logs")
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 0
+
+
+def test_api_logs_rejects_non_admin_cookie(client):
+    """SSO: a user-role JWT in the cookie should be forbidden (403)."""
+    token = _make_jwt("user", username="alice")
+    client.cookies.set("access_token", token)
+    resp = client.get("/api/logs")
+    assert resp.status_code == 403
 
 
 def test_api_logs_with_token(client):

@@ -1,26 +1,34 @@
 # Caddy 反向代理：自动 HTTPS（Let's Encrypt）+ TLS 终结。
-# PUBLIC_DOMAIN 由 docker-compose 注入。审计 API 不暴露公网。
+# PUBLIC_DOMAIN 由 docker-compose 注入。
+#
+# SSO 拓扑：auth 与 gateway 共用同一域名，用路径区分：
+#   https://<PUBLIC_DOMAIN>/        → auth-server（SPA + OAuth 端点）
+#   https://<PUBLIC_DOMAIN>/gw/*    → api-gateway（/v1/*、/audit、/api/logs、/health、/metrics）
+# 这样 auth-server 登录时设置的 access_token HttpOnly cookie 属于同一域名，
+# 浏览器访问 /gw/audit 时自动携带，实现真正的单点登录。
 
 {$PUBLIC_DOMAIN:https://auth.example.com} {
-    # auth-server（SPA + OAuth 端点）
-    reverse_proxy auth-server:8091
-    encode gzip
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        Referrer-Policy "no-referrer"
+    # --- api-gateway under /gw/* (strip prefix before proxying) ---
+    handle_path /gw/* {
+        reverse_proxy api-gateway:8092
+        encode gzip
+        header {
+            Strict-Transport-Security "max-age=31536000; includeSubDomains"
+            X-Content-Type-Options "nosniff"
+            X-Frame-Options "DENY"
+            Referrer-Policy "no-referrer"
+        }
     }
-}
 
-{$PUBLIC_GATEWAY_DOMAIN:https://gw.example.com} {
-    # api-gateway（/v1/*、/health、/metrics）
-    reverse_proxy api-gateway:8092
-    encode gzip
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        Referrer-Policy "no-referrer"
+    # --- auth-server at root (SPA + OAuth) ---
+    handle {
+        reverse_proxy auth-server:8091
+        encode gzip
+        header {
+            Strict-Transport-Security "max-age=31536000; includeSubDomains"
+            X-Content-Type-Options "nosniff"
+            X-Frame-Options "DENY"
+            Referrer-Policy "no-referrer"
+        }
     }
 }

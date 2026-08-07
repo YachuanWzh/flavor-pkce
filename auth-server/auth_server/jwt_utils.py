@@ -67,7 +67,7 @@ def _load_private_key():
 
 def create_jwt(
     sub: str, client_id: str, scope: str = "", username: str = "",
-    config_version: int | None = None,
+    config_version: int | None = None, role: str = "user",
 ) -> str:
     """Create a signed JWT access token.
 
@@ -76,6 +76,9 @@ def create_jwt(
         client_id: OAuth client ID
         scope: Space-separated scopes
         username: Human-readable username (for audit logs)
+        config_version: User LLM-config version, if any
+        role: User role ("user" or "admin"). Included in the token so
+            services can enforce role-based access without a DB lookup.
 
     Returns:
         Signed JWT string
@@ -91,6 +94,7 @@ def create_jwt(
         "exp": int((now + timedelta(seconds=JWT_EXPIRES_IN)).timestamp()),
         "jti": jti,
         "username": username or sub,
+        "role": role,
     }
     if config_version is not None:
         payload["config_version"] = config_version
