@@ -37,8 +37,12 @@ def log_request(
     level: str = "INFO",
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
     model: str | None = None,
+    service_name: str | None = None,
     session_id: str | None = None,
+    user_id: str | None = None,
     request_body: str | None = None,
     response_body: str | None = None,
 ) -> None:
@@ -58,10 +62,18 @@ def log_request(
         entry["prompt_tokens"] = prompt_tokens
     if completion_tokens is not None:
         entry["completion_tokens"] = completion_tokens
+    if cache_read_tokens is not None:
+        entry["cache_read_tokens"] = cache_read_tokens
+    if cache_creation_tokens is not None:
+        entry["cache_creation_tokens"] = cache_creation_tokens
     if model is not None:
         entry["model"] = model
+    if service_name is not None:
+        entry["service_name"] = service_name
     if session_id is not None:
         entry["session_id"] = session_id
+    if user_id is not None:
+        entry["user_id"] = user_id
 
     getattr(_logger, level.lower())(json.dumps(entry, default=str))
 
@@ -76,8 +88,12 @@ def log_request(
         level=level,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
         model=model,
+        service_name=service_name,
         session_id=session_id,
+        user_id=user_id,
         request_body=request_body,
         response_body=response_body,
     )

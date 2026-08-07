@@ -95,6 +95,63 @@ def test_ip_like_hostname_that_resolves_to_private_rejected(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Operator allowlist: approved hosts bypass the SSRF check
+# ---------------------------------------------------------------------------
+
+def test_allowlisted_loopback_accepted():
+    """An operator-approved loopback host passes even though it is private."""
+    assert validate_upstream_url(
+        "http://127.0.0.1:8080/v1/chat",
+        allowlist=["127.0.0.1"],
+    ) is True
+
+
+def test_allowlisted_hostname_resolving_to_private_accepted(monkeypatch):
+    """An approved hostname is exempt even when DNS resolves to a reserved
+    range (e.g. a proxy fake-ip range like 198.18.0.0/15)."""
+    import socket
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.42", 0)),
+        ],
+    )
+    assert validate_upstream_url(
+        "https://api.deepseek.com/anthropic",
+        allowlist=["api.deepseek.com"],
+    ) is True
+
+
+def test_allowlist_matching_is_case_insensitive(monkeypatch):
+    import socket
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
+        ],
+    )
+    assert validate_upstream_url(
+        "http://LLM.Example.com/x",
+        allowlist=["llm.example.com"],
+    ) is True
+
+
+def test_non_allowlisted_private_still_rejected(monkeypatch):
+    """Hosts outside the allowlist keep the SSRF checks."""
+    import socket
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.1.2.3", 0)),
+        ],
+    )
+    assert validate_upstream_url(
+        "http://evil.example.com/x",
+        allowlist=["other.example.com"],
+    ) is False
+
+
+# ---------------------------------------------------------------------------
 # Integration: proxy refuses a private upstream_url
 # ---------------------------------------------------------------------------
 

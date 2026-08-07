@@ -115,6 +115,8 @@ def test_token_exchange_success(client):
     import jwt
     decoded = jwt.decode(access_token, options={"verify_signature": False})
     assert decoded["config_version"] == data["config_version"]
+    # P0-13: JWT must carry the user's role so the gateway can enforce admin-only routes
+    assert decoded["role"] == "user"
 
 
 def test_token_exchange_wrong_code_verifier(client):

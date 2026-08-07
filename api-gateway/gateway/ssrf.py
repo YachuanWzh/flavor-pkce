@@ -11,10 +11,18 @@ rejects:
   (defense against DNS-rebinding style tricks).
 
 A hostname is only accepted when *every* resolved address is public.
+
+Operator-approved hosts can bypass these checks via the ``allowlist``
+argument: hosts listed there (hostnames or literal IPs, matched
+case-insensitively) are trusted without resolution. This is the
+operator-approval escape hatch for on-prem/private LLM endpoints or
+environments whose DNS resolves to reserved ranges (e.g. a proxy
+fake-ip range such as 198.18.0.0/15).
 """
 
 import ipaddress
 import socket
+from collections.abc import Iterable
 from urllib.parse import urlsplit
 
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -57,11 +65,12 @@ def _host_has_allowed_ips(host: str) -> bool:
     return True
 
 
-def validate_upstream_url(url: str) -> bool:
+def validate_upstream_url(url: str, allowlist: Iterable[str] = ()) -> bool:
     """Validate an upstream URL for outbound proxying.
 
-    Returns True when the URL is http(s) and its host is a public literal IP
-    or resolves entirely to public addresses.
+    Returns True when the URL is http(s) and its host is a public literal IP,
+    resolves entirely to public addresses, or is explicitly listed in
+    ``allowlist`` (operator-approved hosts bypass the checks).
     """
     if not url:
         return False
@@ -74,6 +83,14 @@ def validate_upstream_url(url: str) -> bool:
     host = parts.hostname
     if not host:
         return False
+
+    allowed = {
+        entry.strip().lower()
+        for entry in allowlist
+        if entry and entry.strip()
+    }
+    if host.lower() in allowed:
+        return True
 
     # Literal IP: check the address directly.
     try:

@@ -23,6 +23,13 @@ def clean_db():
         os.remove(tmp_path)
 
 
+@pytest.fixture(autouse=True)
+def ensure_keys():
+    """Make sure RSA keys exist so JWT signing works."""
+    from auth_server.jwt_utils import _ensure_keys_exist
+    _ensure_keys_exist()
+
+
 @pytest.fixture
 def client():
     """Create test client."""
@@ -78,6 +85,26 @@ def test_login_success(client):
     assert "access_token" not in data  # login returns session, not JWT
     assert "session_token" in data
     assert "Set-Cookie" in resp.headers
+
+
+def test_login_sets_sso_access_token_cookie(client):
+    """Login should set an HttpOnly access_token cookie with role=user (SSO)."""
+    client.post("/register", json={
+        "username": "sso_user",
+        "password": "MyPass123",
+    })
+    resp = client.post("/login", data={
+        "username": "sso_user",
+        "password": "MyPass123",
+    })
+    assert resp.status_code == 200
+    assert "access_token" in resp.headers.get("Set-Cookie", "")
+    # Decode the JWT to verify it carries role=user
+    import jwt
+    cookie = resp.headers["Set-Cookie"]
+    value = cookie.split("access_token=")[1].split(";")[0]
+    decoded = jwt.decode(value, options={"verify_signature": False})
+    assert decoded["role"] == "user"
 
 
 def test_login_wrong_password(client):

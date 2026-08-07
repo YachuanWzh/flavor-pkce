@@ -23,6 +23,16 @@ UPSTREAM_URL = os.environ.get("UPSTREAM_URL", "https://api.openai.com")
 UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "")
 UPSTREAM_AUTH_TYPE = os.environ.get("UPSTREAM_AUTH_TYPE", "x-api-key").lower()
 
+# Operator-approved upstream hosts (hostnames or literal IPs, comma-separated)
+# that bypass the outbound SSRF check (P0-7). Use for on-prem/private LLM
+# endpoints, or environments whose DNS resolves to reserved ranges such as a
+# proxy fake-ip range (198.18.0.0/15).
+UPSTREAM_URL_ALLOWLIST = {
+    host.strip().lower()
+    for host in os.environ.get("UPSTREAM_URL_ALLOWLIST", "").split(",")
+    if host.strip()
+}
+
 # Per-user routing lookup. Tokens without config_version retain the legacy
 # global route above during migration.
 AUTH_SERVER_INTERNAL_URL = os.environ.get(

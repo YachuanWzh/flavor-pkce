@@ -5,10 +5,11 @@ Every request is logged as a single JSON line and tracked via Prometheus
 metrics exposed at ``/metrics``.  Audit logs are persisted to SQLite and
 browsable at ``/audit``.
 
-Token usage (prompt_tokens / completion_tokens) is extracted from both
-non-streaming and streaming responses.  For Anthropic SSE streams the
-``input_tokens`` are captured from the ``message_start`` event; output
-tokens arrive too late for synchronous capture.
+Token usage (prompt / completion tokens and provider prompt-cache
+breakdowns) is extracted from both non-streaming and streaming
+responses.  For SSE streams the full usage is recovered from the
+buffered body once the stream is drained (Anthropic ``message_start``
+/ ``message_delta``; OpenAI final usage chunk).
 """
 
 import json as _json
@@ -87,10 +88,13 @@ async def _is_jti_revoked(jti: str) -> bool:
     return revoked
 
 # Path prefixes that the observability middleware should NOT audit-log.
-_AUDIT_SKIP_PREFIXES = ("/metrics", "/api/logs", "/health")
+_AUDIT_SKIP_PREFIXES = ("/metrics", "/api/logs", "/api/stats", "/health", "/report")
 
 # Path to the static audit-viewer HTML page.
 _AUDIT_HTML_PATH = Path(__file__).parent / "web" / "logs.html"
+
+# Path to the static usage-report HTML page.
+_REPORT_HTML_PATH = Path(__file__).parent / "web" / "report.html"
 
 
 def load_public_key():
@@ -163,8 +167,12 @@ async def _resolve_user_routing(payload: dict) -> tuple[dict | None, JSONRespons
         return None, JSONResponse(status_code=502, content={"error": "Invalid routing response"})
 
     # SSRF guard (P0-7): refuse to proxy to private/metadata/loopback targets,
-    # even when the user controls their own upstream_url.
-    if not validate_upstream_url(str(routing.get("upstream_url", ""))):
+    # even when the user controls their own upstream_url. Operator-approved
+    # hosts (UPSTREAM_URL_ALLOWLIST) bypass the check.
+    if not validate_upstream_url(
+        str(routing.get("upstream_url", "")),
+        gateway.config.UPSTREAM_URL_ALLOWLIST,
+    ):
         return None, JSONResponse(
             status_code=400,
             content={
@@ -202,17 +210,63 @@ def metrics():
 # Audit-log API
 # ---------------------------------------------------------------------------
 
-def _require_audit_token(request: Request) -> None:
-    """Gate the audit data API behind a shared secret (P0-1).
+def _extract_jwt_from_request(request: Request) -> str | None:
+    """Extract a JWT from the Authorization header or x-api-key header."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        return auth_header[7:]
+    return request.headers.get("x-api-key") or None
 
-    When no token is configured, the API refuses access entirely
-    (fail-closed for audit data).
+
+def _require_admin(request: Request) -> dict:
+    """Require a valid JWT whose role claim is 'admin'.
+
+    This is the primary gate for the audit-log API.  It returns the
+    verified payload so callers can attribute the action.
     """
+    token = _extract_jwt_from_request(request)
+    payload = verify_jwt(token) if token else None
+    if payload is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+        )
+    if payload.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Administrator access required",
+        )
+    return payload
+
+
+def _require_audit_token(request: Request) -> dict:
+    """Gate the audit data API behind admin JWT or the legacy shared secret (P0-1).
+
+    Primary auth: a signed JWT with role=admin, supplied either via the
+    ``Authorization: Bearer`` header (scripts/SPA) or the ``access_token``
+    HttpOnly cookie set by the auth server on login (SSO in the browser).
+    Legacy fallback: the operator-configured AUDIT_API_TOKEN via the
+    ``x-audit-token`` header. When no credential matches, the API is
+    fail-closed (401/403).
+    """
+    token = _extract_jwt_from_request(request)
+    if not token:
+        token = request.cookies.get("access_token", "")
+    if token:
+        payload = verify_jwt(token)
+        if payload is not None:
+            if payload.get("role") == "admin":
+                return payload
+            raise HTTPException(
+                status_code=403,
+                detail="Administrator access required",
+            )
+
     configured = gateway.config.AUDIT_API_TOKEN
     if not configured:
         raise HTTPException(
             status_code=401,
-            detail="Audit API is not enabled (set AUDIT_API_TOKEN)",
+            detail="Authentication required",
         )
     supplied = request.headers.get("x-audit-token", "")
     if not secrets.compare_digest(supplied, configured):
@@ -220,6 +274,7 @@ def _require_audit_token(request: Request) -> None:
             status_code=401,
             detail="Invalid audit token",
         )
+    return {"role": "admin"}
 
 
 @app.get("/api/logs")
@@ -275,6 +330,70 @@ def audit_page():
     return FileResponse(_AUDIT_HTML_PATH, media_type="text/html; charset=utf-8")
 
 
+@app.get("/report")
+def report_page():
+    """Serve the usage-report dashboard HTML page."""
+    return FileResponse(_REPORT_HTML_PATH, media_type="text/html; charset=utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Report (stats) API — aggregates for the dashboard
+# ---------------------------------------------------------------------------
+
+@app.get("/api/stats/tokens")
+def api_stats_tokens(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+    group_by: str | None = Query(None),
+):
+    """Daily token usage, optionally grouped by user / model / service."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.token_usage(start_date, end_date, user, group_by)}
+
+
+@app.get("/api/stats/cache")
+def api_stats_cache(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+):
+    """Daily prompt-cache token usage and hit ratio."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.cache_usage(start_date, end_date, user)}
+
+
+@app.get("/api/stats/requests")
+def api_stats_requests(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+):
+    """Daily request volume, errors and average latency."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.request_stats(start_date, end_date, user)}
+
+
+@app.get("/api/stats/models")
+def api_stats_models(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Top models ranked by total token consumption."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.top_models(start_date, end_date, user, limit)}
+
+
 # ---------------------------------------------------------------------------
 # Middleware: logging + metrics for every request
 # ---------------------------------------------------------------------------
@@ -287,6 +406,7 @@ async def log_metrics_middleware(request: Request, call_next):
     status_code = 0
 
     try:
+        request.state.audit_start = start
         response = await call_next(request)
         status_code = response.status_code
         return response
@@ -306,34 +426,52 @@ async def log_metrics_middleware(request: Request, call_next):
             method=request.method, path=path_label,
         ).observe(duration)
 
+        # Streamed (SSE) responses write their own audit log once the
+        # stream is drained — usage fields only exist at that point.
         if not any(
             request.url.path.startswith(p) for p in _AUDIT_SKIP_PREFIXES
-        ):
-            user = getattr(request.state, "user_sub", "-")
-            session_id = getattr(request.state, "session_id", None)
-            upstream_ms = getattr(request.state, "upstream_ms", None)
-            prompt_tokens = getattr(request.state, "prompt_tokens", None)
-            completion_tokens = getattr(request.state, "completion_tokens", None)
-            model = getattr(request.state, "model", None)
-            request_body = getattr(request.state, "request_body", None)
-            response_body = getattr(request.state, "response_body", None)
-            level = "ERROR" if status_code >= 500 else "INFO"
+        ) and not getattr(request.state, "defer_audit_log", False):
+            _audit_log_request(request, status_code, duration)
 
-            log_request(
-                user=user,
-                method=request.method,
-                path=request.url.path,
-                status=status_code,
-                duration_ms=duration * 1000,
-                upstream_ms=upstream_ms,
-                level=level,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                model=model,
-                session_id=session_id,
-                request_body=request_body,
-                response_body=response_body,
-            )
+
+def _audit_log_request(
+    request: Request, status_code: int, duration: float,
+) -> None:
+    """Write one audit-log entry from the request's captured state."""
+    log_request(
+        user=getattr(request.state, "user_sub", "-"),
+        method=request.method,
+        path=request.url.path,
+        status=status_code,
+        duration_ms=duration * 1000,
+        upstream_ms=getattr(request.state, "upstream_ms", None),
+        level="ERROR" if status_code >= 500 else "INFO",
+        prompt_tokens=getattr(request.state, "prompt_tokens", None),
+        completion_tokens=getattr(request.state, "completion_tokens", None),
+        cache_read_tokens=getattr(request.state, "cache_read_tokens", None),
+        cache_creation_tokens=getattr(
+            request.state, "cache_creation_tokens", None,
+        ),
+        model=getattr(request.state, "model", None),
+        service_name=getattr(request.state, "service_name", None),
+        session_id=getattr(request.state, "session_id", None),
+        user_id=getattr(request.state, "user_id", None),
+        request_body=getattr(request.state, "request_body", None),
+        response_body=getattr(request.state, "response_body", None),
+    )
+
+
+def _finalize_stream_audit_log(request: Request) -> None:
+    """Write the audit log for an SSE request once the stream is drained.
+
+    At this point the prompt/completion/cache tokens recovered from the
+    buffered stream are complete, unlike at middleware exit.  The sync
+    SQLite insert adds only tail latency after the final chunk.
+    """
+    start = getattr(request.state, "audit_start", None)
+    duration = (time.perf_counter() - start) if start else 0.0
+    status_code = getattr(request.state, "audit_status_code", 200)
+    _audit_log_request(request, status_code, duration)
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +518,8 @@ async def proxy(request: Request, path: str):
     # Human-readable username comes from the JWT 'username' claim (added
     # by the auth server).  Older tokens only have 'sub' (a UUID).
     request.state.user_sub = payload.get("username") or payload.get("sub", "-")
+    # Stable identifier for cross-system joins (auth-server users.id).
+    request.state.user_id = payload.get("sub") or None
 
     # Session identifier: prefer the JWT 'jti' (JWT ID) claim; fall back
     # to 'sid' (session ID) or generate one from sub + current time.
@@ -399,7 +539,10 @@ async def proxy(request: Request, path: str):
     # cannot target private/metadata addresses. The legacy fallback upstream
     # is operator-configured (UPSTREAM_URL env) and is trusted, so it is exempt.
     if routing.get("service_name") != "legacy-upstream":
-        if not validate_upstream_url(str(routing.get("upstream_url", ""))):
+        if not validate_upstream_url(
+            str(routing.get("upstream_url", "")),
+            gateway.config.UPSTREAM_URL_ALLOWLIST,
+        ):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -461,6 +604,9 @@ async def proxy(request: Request, path: str):
 
         if is_sse:
             took_sse = True
+            # The middleware must not audit-log this request: usage fields
+            # are only complete once the stream is drained (sse_generator).
+            request.state.defer_audit_log = True
             # Forward SSE chunks to the client in real time while
             # collecting them in the background for audit logging.
             collected: list[bytes] = []
@@ -483,17 +629,23 @@ async def proxy(request: Request, path: str):
                     # Finalise audit state after the stream is drained.
                     combined = b"".join(collected)
                     request.state.response_body = _decode_body(combined)
-                    request.state.completion_tokens = None  # arrives too late
+                    # Usage events arrive late in the stream (Anthropic
+                    # message_delta / OpenAI final usage chunk); recover
+                    # them from the full buffered body now.
+                    _extract_usage_from_stream(request, combined)
                     request.state.upstream_ms = (
                         (time.perf_counter() - upstream_start) * 1000
                     )
                     await resp.aclose()
                     await client.aclose()
+                    # Usage is final now — write the deferred audit log.
+                    _finalize_stream_audit_log(request)
 
             resp_headers = _clean_response_headers(
                 dict(resp.headers), streaming=True,
             )
             status_code = resp.status_code
+            request.state.audit_status_code = status_code
             if status_code >= 500:
                 UPSTREAM_ERRORS.labels(method=request.method, path=path).inc()
 
@@ -581,7 +733,10 @@ def _extract_full_token_usage(request: Request, body: bytes) -> None:
     """Parse an upstream LLM JSON response for token usage.
 
     Handles OpenAI (usage.prompt_tokens/completion_tokens) and Anthropic
-    (usage.input_tokens/output_tokens) formats.
+    (usage.input_tokens/output_tokens) formats, plus provider prompt-cache
+    breakdowns (Anthropic ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens``; OpenAI
+    ``input_tokens_details.cached_tokens``).
     """
     usage = _parse_usage_json(body)
     request.state.prompt_tokens = _int_or_none(
@@ -590,6 +745,72 @@ def _extract_full_token_usage(request: Request, body: bytes) -> None:
     request.state.completion_tokens = _int_or_none(
         usage, "completion_tokens", "output_tokens",
     )
+    request.state.cache_read_tokens = _cache_read_from_usage(usage)
+    request.state.cache_creation_tokens = _int_or_none(
+        usage, "cache_creation_input_tokens",
+    )
+
+
+def _cache_read_from_usage(usage: dict) -> int | None:
+    """Extract cache-read tokens from a usage object (any provider)."""
+    direct = _int_or_none(usage, "cache_read_input_tokens")
+    if direct is not None:
+        return direct
+    details = usage.get("input_tokens_details")
+    if isinstance(details, dict):
+        return _int_or_none(details, "cached_tokens")
+    return None
+
+
+def _extract_usage_from_stream(request: Request, body: bytes) -> None:
+    """Recover full token usage from a collected SSE stream body.
+
+    Streaming responses deliver usage in late events (Anthropic
+    ``message_start`` for input tokens, ``message_delta`` for output
+    tokens; OpenAI emits a final chunk with a complete ``usage`` object
+    when usage reporting is enabled).  By the time this runs the entire
+    stream has been buffered, so every ``data:`` frame is parsed and the
+    usage fields merged together.  Fields that never appear stay ``None``.
+    """
+    text = body.decode("utf-8", errors="replace")
+    prompt = None
+    completion = None
+    cache_read = None
+    cache_creation = None
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped.startswith("data:"):
+            continue
+        payload = stripped[5:].strip()
+        if payload in ("", "[DONE]"):
+            continue
+        try:
+            obj = _json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        usage = obj.get("usage")
+        if obj.get("type") == "message_start":
+            usage = obj.get("message", {}).get("usage")
+        if not isinstance(usage, dict):
+            continue
+        value = _int_or_none(usage, "prompt_tokens", "input_tokens")
+        if value is not None:
+            prompt = value
+        value = _int_or_none(usage, "completion_tokens", "output_tokens")
+        if value is not None:
+            completion = value
+        value = _cache_read_from_usage(usage)
+        if value is not None:
+            cache_read = value
+        value = _int_or_none(usage, "cache_creation_input_tokens")
+        if value is not None:
+            cache_creation = value
+    request.state.prompt_tokens = prompt
+    request.state.completion_tokens = completion
+    request.state.cache_read_tokens = cache_read
+    request.state.cache_creation_tokens = cache_creation
 
 
 def _extract_input_tokens_from_chunk(chunk: bytes) -> int | None:

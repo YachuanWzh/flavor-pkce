@@ -20,6 +20,7 @@ services:
       - caddy-config:/config
     environment:
       - PUBLIC_DOMAIN=${PUBLIC_DOMAIN:?set PUBLIC_DOMAIN, e.g. auth.example.com}
+      - PUBLIC_GATEWAY_URL=${PUBLIC_GATEWAY_URL:-https://${PUBLIC_DOMAIN}/gw}
     depends_on:
       auth-server:
         condition: service_healthy
@@ -53,7 +54,7 @@ services:
       - AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS:-180}
       - REFRESH_TOKEN_EXPIRES_IN=${REFRESH_TOKEN_EXPIRES_IN:-2592000}
       - CORS_ORIGINS=${PUBLIC_AUTH_ORIGIN:?set PUBLIC_AUTH_ORIGIN, e.g. https://auth.example.com}
-      - PUBLIC_GATEWAY_URL=${PUBLIC_GATEWAY_URL:?set PUBLIC_GATEWAY_URL, e.g. https://gw.example.com}
+      - PUBLIC_GATEWAY_URL=${PUBLIC_GATEWAY_URL:-https://${PUBLIC_DOMAIN}/gw}
       - ADMIN_USERNAME=${ADMIN_USERNAME}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - DEFAULT_LLM_PROVIDER_ID=${DEFAULT_LLM_PROVIDER_ID:-deepseek}
@@ -84,6 +85,7 @@ services:
       - UPSTREAM_URL=${UPSTREAM_URL:?set UPSTREAM_URL (default LLM upstream)}
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:?set UPSTREAM_API_KEY}
       - UPSTREAM_AUTH_TYPE=${UPSTREAM_AUTH_TYPE:-x-api-key}
+      - UPSTREAM_URL_ALLOWLIST=${UPSTREAM_URL_ALLOWLIST:-}
       - AUTH_SERVER_INTERNAL_URL=http://auth-server:8091
       - INTERNAL_SERVICE_TOKEN=${INTERNAL_SERVICE_TOKEN:?set a strong INTERNAL_SERVICE_TOKEN}
       - AUDIT_API_TOKEN=${AUDIT_API_TOKEN:?set AUDIT_API_TOKEN for the audit API}

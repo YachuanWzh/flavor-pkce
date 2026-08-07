@@ -24,7 +24,13 @@ def _row_hash(
     prompt_tokens: int | None, completion_tokens: int | None, model: str | None,
     session_id: str | None, request_body: str | None, response_body: str | None,
 ) -> str:
-    """SHA-256 of the previous hash plus this row's canonical content."""
+    """SHA-256 of the previous hash plus this row's canonical content.
+
+    The report columns added later (``cache_read_tokens``,
+    ``cache_creation_tokens``, ``service_name``, ``user_id``) are
+    intentionally excluded: they are analytical fields, and hashing them
+    would invalidate chains written before the columns existed.
+    """
     payload = json.dumps(
         [timestamp, user, method, path, status, duration_ms, upstream_ms, level,
          prompt_tokens, completion_tokens, model, session_id,
@@ -71,6 +77,10 @@ def init_audit_db() -> None:
             completion_tokens INTEGER,
             model             TEXT,
             session_id        TEXT,
+            cache_read_tokens     INTEGER,
+            cache_creation_tokens INTEGER,
+            service_name          TEXT,
+            user_id               TEXT,
             request_body      TEXT,
             response_body     TEXT,
             prev_hash         TEXT,
@@ -86,6 +96,10 @@ def init_audit_db() -> None:
         ("completion_tokens", "INTEGER"),
         ("model", "TEXT"),
         ("session_id", "TEXT"),
+        ("cache_read_tokens", "INTEGER"),
+        ("cache_creation_tokens", "INTEGER"),
+        ("service_name", "TEXT"),
+        ("user_id", "TEXT"),
         ("request_body", "TEXT"),
         ("response_body", "TEXT"),
         ("prev_hash", "TEXT"),
@@ -100,6 +114,7 @@ def init_audit_db() -> None:
     for idx_name, idx_col in (
         ("idx_audit_model", "model"),
         ("idx_audit_session", "session_id"),
+        ("idx_audit_user_id", "user_id"),
     ):
         try:
             conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON audit_logs({idx_col})")
@@ -124,6 +139,10 @@ def insert_log(
     completion_tokens: int | None = None,
     model: str | None = None,
     session_id: str | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
+    service_name: str | None = None,
+    user_id: str | None = None,
     request_body: str | None = None,
     response_body: str | None = None,
 ) -> None:
@@ -155,11 +174,15 @@ def insert_log(
         """INSERT INTO audit_logs
            (timestamp, "user", method, path, status, duration_ms,
             upstream_ms, level, prompt_tokens, completion_tokens, model,
-            session_id, request_body, response_body, prev_hash, hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            session_id, cache_read_tokens, cache_creation_tokens,
+            service_name, user_id, request_body, response_body,
+            prev_hash, hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (timestamp, user, method, path, status, duration_ms,
          upstream_ms, level, prompt_tokens, completion_tokens, model,
-         session_id, request_body, response_body, prev_hash, row_hash),
+         session_id, cache_read_tokens, cache_creation_tokens,
+         service_name, user_id, request_body, response_body,
+         prev_hash, row_hash),
     )
     conn.commit()
     conn.close()
@@ -260,7 +283,8 @@ def query_logs(params: QueryParams) -> PageResult:
     _LIST_COLS = (
         "id, timestamp, \"user\", method, path, status, duration_ms,"
         " upstream_ms, level, prompt_tokens, completion_tokens, model,"
-        " session_id"
+        " session_id, cache_read_tokens, cache_creation_tokens,"
+        " service_name, user_id"
     )
 
     conn = _connect()
