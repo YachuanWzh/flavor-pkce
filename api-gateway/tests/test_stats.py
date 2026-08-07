@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 import gateway.config as config
 from gateway.database import init_audit_db, insert_log, query_logs
+from gateway.stats import cache_usage
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +316,163 @@ class TestStatsAPI:
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
         assert "Usage Report" in resp.text
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: streamed SSE usage reaches the audit log and /api/stats
+# ---------------------------------------------------------------------------
+
+class _FakeSseResponse:
+    """Minimal stand-in for an httpx streaming response."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.headers = {"content-type": "text/event-stream"}
+        self.status_code = 200
+
+    def aiter_bytes(self):
+        async def gen():
+            for chunk in self._chunks:
+                yield chunk
+
+        return gen()
+
+    async def aclose(self):
+        pass
+
+
+class _FakeSseClient:
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def build_request(self, **kwargs):
+        return kwargs
+
+    async def send(self, request, stream=False):
+        return _FakeSseResponse(self._chunks)
+
+    async def aclose(self):
+        pass
+
+
+class TestStreamedAuditLogEndToEnd:
+    """Regression: SSE usage must land in audit_logs despite deferred drain."""
+
+    SSE_CHUNKS = [
+        b'event: message_start\n'
+        b'data: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":25,"cache_creation_input_tokens":1500,'
+        b'"cache_read_input_tokens":7123}}}\n\n',
+        b'event: content_block_delta\n'
+        b'data: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n',
+        b'event: message_delta\n'
+        b'data: {"type":"message_delta","usage":{"output_tokens":321}}\n\n',
+    ]
+
+    def _client(self, monkeypatch):
+        import gateway.config as config
+        import gateway.main as gm
+
+        keys_dir = os.path.join(
+            os.path.dirname(__file__), "..", "..",
+            "auth-server", "auth_server", "keys",
+        )
+        os.makedirs(keys_dir, exist_ok=True)
+        import sys
+        sys.path.insert(
+            0, os.path.join(os.path.dirname(__file__), "..", "..", "auth-server"),
+        )
+        from auth_server.jwt_utils import _ensure_keys_exist
+        _ensure_keys_exist()
+        config.JWT_PUBLIC_KEY_PATH = os.path.join(keys_dir, "public.pem")
+        config.AUDIT_API_TOKEN = "test-audit-token"
+
+        fd, tmp = tempfile.mkstemp(suffix=".db", prefix="stats_sse_test_")
+        os.close(fd)
+        old_db = config.AUDIT_DB_PATH
+        config.AUDIT_DB_PATH = tmp
+        init_audit_db()
+        monkeypatch.setattr(gm, "init_audit_db", lambda: None)
+
+        import jwt as pyjwt
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        import time as _time
+        now = int(_time.time())
+        token = pyjwt.encode(
+            {"sub": "alice", "username": "alice", "jti": "j1",
+             "iat": now, "exp": now + 3600},
+            key, algorithm="RS256",
+        )
+        pub = key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        key_tmp = tempfile.NamedTemporaryFile(suffix=".pem", delete=False)
+        key_tmp.write(pub)
+        key_tmp.close()
+        gm._public_key = None
+        config.JWT_PUBLIC_KEY_PATH = key_tmp.name
+
+        async def fake_routing(payload):
+            return {
+                "service_name": "anthropic-main",
+                "upstream_url": "https://api.example.com",
+                "upstream_api_key": "k",
+                "upstream_auth_type": "x-api-key",
+                "models": [],
+            }, None
+
+        async def fake_revoked(jti):
+            return False
+
+        monkeypatch.setattr(gm, "_resolve_user_routing", fake_routing)
+        monkeypatch.setattr(gm, "_is_jti_revoked", fake_revoked)
+        config.UPSTREAM_URL_ALLOWLIST = {"api.example.com"}
+        monkeypatch.setattr(
+            gm.httpx, "AsyncClient", lambda **kw: _FakeSseClient(self.SSE_CHUNKS),
+        )
+
+        client = TestClient(gm.app)
+        old_allowlist = config.UPSTREAM_URL_ALLOWLIST
+        yield client, token, tmp, key_tmp.name, old_db
+        config.AUDIT_DB_PATH = old_db
+        config.UPSTREAM_URL_ALLOWLIST = old_allowlist
+        for path in (tmp, key_tmp.name):
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_sse_usage_persisted_to_audit_log(self, monkeypatch):
+        gen = self._client(monkeypatch)
+        client, token, _tmp, _key, _old = next(gen)
+        try:
+            resp = client.post(
+                "/v1/messages",
+                json={"model": "deepseek-v4-pro", "stream": True},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            # Drain complete: the deferred audit task has been flushed by
+            # the time the client finishes consuming the stream.
+            rows = query_logs({"page": 1, "page_size": 10})["items"]
+            assert len(rows) == 1
+            row = rows[0]
+            assert row["prompt_tokens"] == 25
+            assert row["completion_tokens"] == 321
+            assert row["cache_read_tokens"] == 7123
+            assert row["cache_creation_tokens"] == 1500
+            assert row["upstream_ms"] is not None
+
+            days = cache_usage()
+            assert len(days) == 1
+            assert days[0]["cache_read_tokens"] == 7123
+            assert days[0]["hit_ratio"] == pytest.approx(
+                7123 / (25 + 7123 + 1500), rel=1e-6,
+            )
+        finally:
+            try:
+                next(gen)
+            except StopIteration:
+                pass

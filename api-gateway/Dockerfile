@@ -1,7 +1,10 @@
 FROM python:3.12-slim
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
+# Allow building behind restrictive networks (e.g. a PyPI mirror) without
+# changing the default behaviour.
+ARG PIP_INDEX_URL=https://pypi.org/simple
+RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} \
     "fastapi>=0.115.0" \
     "uvicorn[standard]>=0.34.0" \
     "pyjwt>=2.9.0" \

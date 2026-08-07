@@ -406,6 +406,7 @@ async def log_metrics_middleware(request: Request, call_next):
     status_code = 0
 
     try:
+        request.state.audit_start = start
         response = await call_next(request)
         status_code = response.status_code
         return response
@@ -425,42 +426,52 @@ async def log_metrics_middleware(request: Request, call_next):
             method=request.method, path=path_label,
         ).observe(duration)
 
+        # Streamed (SSE) responses write their own audit log once the
+        # stream is drained — usage fields only exist at that point.
         if not any(
             request.url.path.startswith(p) for p in _AUDIT_SKIP_PREFIXES
-        ):
-            user = getattr(request.state, "user_sub", "-")
-            session_id = getattr(request.state, "session_id", None)
-            upstream_ms = getattr(request.state, "upstream_ms", None)
-            prompt_tokens = getattr(request.state, "prompt_tokens", None)
-            completion_tokens = getattr(request.state, "completion_tokens", None)
-            cache_read_tokens = getattr(request.state, "cache_read_tokens", None)
-            cache_creation_tokens = getattr(request.state, "cache_creation_tokens", None)
-            model = getattr(request.state, "model", None)
-            service_name = getattr(request.state, "service_name", None)
-            user_id = getattr(request.state, "user_id", None)
-            request_body = getattr(request.state, "request_body", None)
-            response_body = getattr(request.state, "response_body", None)
-            level = "ERROR" if status_code >= 500 else "INFO"
+        ) and not getattr(request.state, "defer_audit_log", False):
+            _audit_log_request(request, status_code, duration)
 
-            log_request(
-                user=user,
-                method=request.method,
-                path=request.url.path,
-                status=status_code,
-                duration_ms=duration * 1000,
-                upstream_ms=upstream_ms,
-                level=level,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cache_read_tokens=cache_read_tokens,
-                cache_creation_tokens=cache_creation_tokens,
-                model=model,
-                service_name=service_name,
-                session_id=session_id,
-                user_id=user_id,
-                request_body=request_body,
-                response_body=response_body,
-            )
+
+def _audit_log_request(
+    request: Request, status_code: int, duration: float,
+) -> None:
+    """Write one audit-log entry from the request's captured state."""
+    log_request(
+        user=getattr(request.state, "user_sub", "-"),
+        method=request.method,
+        path=request.url.path,
+        status=status_code,
+        duration_ms=duration * 1000,
+        upstream_ms=getattr(request.state, "upstream_ms", None),
+        level="ERROR" if status_code >= 500 else "INFO",
+        prompt_tokens=getattr(request.state, "prompt_tokens", None),
+        completion_tokens=getattr(request.state, "completion_tokens", None),
+        cache_read_tokens=getattr(request.state, "cache_read_tokens", None),
+        cache_creation_tokens=getattr(
+            request.state, "cache_creation_tokens", None,
+        ),
+        model=getattr(request.state, "model", None),
+        service_name=getattr(request.state, "service_name", None),
+        session_id=getattr(request.state, "session_id", None),
+        user_id=getattr(request.state, "user_id", None),
+        request_body=getattr(request.state, "request_body", None),
+        response_body=getattr(request.state, "response_body", None),
+    )
+
+
+def _finalize_stream_audit_log(request: Request) -> None:
+    """Write the audit log for an SSE request once the stream is drained.
+
+    At this point the prompt/completion/cache tokens recovered from the
+    buffered stream are complete, unlike at middleware exit.  The sync
+    SQLite insert adds only tail latency after the final chunk.
+    """
+    start = getattr(request.state, "audit_start", None)
+    duration = (time.perf_counter() - start) if start else 0.0
+    status_code = getattr(request.state, "audit_status_code", 200)
+    _audit_log_request(request, status_code, duration)
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +604,9 @@ async def proxy(request: Request, path: str):
 
         if is_sse:
             took_sse = True
+            # The middleware must not audit-log this request: usage fields
+            # are only complete once the stream is drained (sse_generator).
+            request.state.defer_audit_log = True
             # Forward SSE chunks to the client in real time while
             # collecting them in the background for audit logging.
             collected: list[bytes] = []
@@ -624,11 +638,14 @@ async def proxy(request: Request, path: str):
                     )
                     await resp.aclose()
                     await client.aclose()
+                    # Usage is final now — write the deferred audit log.
+                    _finalize_stream_audit_log(request)
 
             resp_headers = _clean_response_headers(
                 dict(resp.headers), streaming=True,
             )
             status_code = resp.status_code
+            request.state.audit_status_code = status_code
             if status_code >= 500:
                 UPSTREAM_ERRORS.labels(method=request.method, path=path).inc()
 
