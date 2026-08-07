@@ -13,10 +13,20 @@ auth-server/auth.db
 *.db
 
 # Env files (API keys, secrets)
+# .env.* covers e.g. deploy/.env.prod; .env.example stays tracked
 .env
+.env.*
+!.env.example
+
+# Logs
+*.log
 
 # Deployment scripts that embed server credentials
 setup_ssh.py
+
+# One-off deploy helper scripts (contain internal server topology)
+deploy_tmp_probe.py
+deploy_tmp_run.py
 
 # IDE
 .idea/
