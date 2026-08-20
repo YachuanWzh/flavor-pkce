@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 export default function LlmConfigForm({
   form,
   onChange,
@@ -8,6 +10,7 @@ export default function LlmConfigForm({
   success,
   submitLabel = "Save route",
 }) {
+  const [showKey, setShowKey] = useState(false);
   return <form className="settings-form" onSubmit={onSubmit}>
     <div className="settings-grid">
       <label><span>Provider ID</span><input required pattern="[A-Za-z0-9_-]+" value={form.provider_id} onChange={(event) => onChange("provider_id", event.target.value)} placeholder="deepseek" /></label>
@@ -17,7 +20,21 @@ export default function LlmConfigForm({
     </div>
 
     <label><span>Upstream URL</span><input required type="url" value={form.upstream_url} onChange={(event) => onChange("upstream_url", event.target.value)} placeholder="https://api.example.com/anthropic" /></label>
-    <label><span>Upstream API key</span><input required={!keyConfigured} type="password" autoComplete="new-password" value={form.upstream_api_key} onChange={(event) => onChange("upstream_api_key", event.target.value)} placeholder={keyConfigured ? "Configured — leave blank to keep it" : "Enter the upstream key"} /></label>
+    <label>
+      <span>Upstream API key</span>
+      <div className="key-field">
+        <input
+          required={!keyConfigured && !form.upstream_api_key}
+          type={showKey ? "text" : "password"}
+          autoComplete="new-password"
+          value={form.upstream_api_key}
+          onChange={(event) => onChange("upstream_api_key", event.target.value)}
+          placeholder={keyConfigured ? "Saved — shown below, edit to replace" : "Enter the upstream key"}
+        />
+        <button type="button" className="key-toggle" onClick={() => setShowKey((current) => !current)}>{showKey ? "Hide" : "Show"}</button>
+      </div>
+      <small>{form.upstream_api_key ? "Stored encrypted; you (or an admin) can see and edit it here." : keyConfigured ? "A key is already stored." : "No key stored yet."}</small>
+    </label>
 
     <div className="model-lane">
       <label><span>Main model</span><input required value={form.default_model} onChange={(event) => onChange("default_model", event.target.value)} placeholder="deepseek-v4-pro" /></label>

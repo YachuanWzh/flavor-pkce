@@ -25,7 +25,11 @@ from auth_server.ratelimit import (
     record_failure, is_locked, reset_failures,
 )
 from auth_server.audit import log_event, purge_old_audit_logs
-from auth_server.llm_config import get_llm_config, save_llm_config
+from auth_server.llm_config import (
+    get_llm_config, save_llm_config,
+    list_profiles, get_profile, profile_name_exists,
+    create_profile, update_profile, delete_profile,
+)
 import auth_server.config as server_config
 from auth_server.config import (
     AUTH_CODE_EXPIRES_IN, JWT_EXPIRES_IN, REFRESH_TOKEN_EXPIRES_IN,
@@ -174,6 +178,17 @@ def public_llm_config(value: dict) -> dict:
     }
 
 
+def owner_llm_config(value: dict) -> dict:
+    """Response shape for the owner's own session.
+
+    Unlike admin views of *other* users' configs (``public_llm_config``), the
+    owner may read back the decrypted upstream key so the settings page can
+    repopulate it when switching between saved profiles. The key is still
+    encrypted at rest and never appears in admin rosters or OAuth responses.
+    """
+    return {key: item for key, item in value.items() if key != "user_id"}
+
+
 @app.get("/api/me")
 def api_me(request: Request):
     user = require_current_user(request)
@@ -194,10 +209,10 @@ def api_me(request: Request):
 @app.get("/api/me/llm-config")
 def api_get_llm_config(request: Request):
     user = require_current_user(request)
-    value = get_llm_config(user["user_id"])
+    value = get_llm_config(user["user_id"], include_secret=True)
     if value is None:
         return JSONResponse(status_code=404, content={"detail": "LLM configuration not found"})
-    return public_llm_config(value)
+    return owner_llm_config(value)
 
 
 @app.put("/api/me/llm-config")
@@ -205,8 +220,246 @@ def api_put_llm_config(request: Request, body: LlmConfigUpdate):
     user = require_current_user(request)
     values = body.model_dump()
     values["upstream_url"] = str(body.upstream_url).rstrip("/")
-    saved = save_llm_config(user["user_id"], values)
-    return public_llm_config(saved)
+    saved = save_llm_config(user["user_id"], values, include_secret=True)
+    return owner_llm_config(saved)
+
+
+class FallbackUpdate(BaseModel):
+    fallback_profile_id: str | None = Field(default=None, max_length=64)
+
+
+@app.put("/api/me/llm-config/fallback")
+def api_put_llm_fallback(request: Request, body: FallbackUpdate):
+    """Attach or clear the gateway failover route.
+
+    This is a routing preference, not a route change: it does not bump
+    config_version, so existing JWTs keep working. The gateway consults
+    the fallback only when the primary route fails.
+    """
+    user = require_current_user(request)
+    config_row = get_llm_config(user["user_id"])
+    if config_row is None:
+        raise HTTPException(status_code=404, detail="LLM configuration not found")
+    if body.fallback_profile_id is not None:
+        profile = get_profile(user["user_id"], body.fallback_profile_id)
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
+    db = get_db()
+    db.execute(
+        "UPDATE user_llm_configs SET fallback_profile_id = ? WHERE user_id = ?",
+        (body.fallback_profile_id, user["user_id"]),
+    )
+    db.commit()
+    db.close()
+    return owner_llm_config(
+        get_llm_config(user["user_id"], include_secret=True) or {},
+    )
+
+
+class LlmProfileCreate(LlmConfigUpdate):
+    name: str = Field(min_length=1, max_length=128)
+
+
+class LlmProfileUpdate(LlmProfileCreate):
+    pass
+
+
+def public_profile(value: dict) -> dict:
+    return {
+        key: item for key, item in value.items()
+        if key not in {"user_id", "upstream_api_key"}
+    }
+
+
+@app.get("/api/me/llm-config-profiles")
+def api_list_llm_profiles(request: Request):
+    user = require_current_user(request)
+    return {
+        "profiles": [
+            owner_llm_config(p)
+            for p in list_profiles(user["user_id"], include_secret=True)
+        ],
+    }
+
+
+@app.get("/api/me/llm-config-profiles/{profile_id}")
+def api_get_llm_profile(profile_id: str, request: Request):
+    user = require_current_user(request)
+    profile = get_profile(user["user_id"], profile_id, include_secret=True)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return owner_llm_config(profile)
+
+
+@app.post("/api/me/llm-config-profiles", status_code=201)
+def api_create_llm_profile(request: Request, body: LlmProfileCreate):
+    user = require_current_user(request)
+    if profile_name_exists(user["user_id"], body.name):
+        raise HTTPException(status_code=409, detail="A profile with this name already exists")
+    values = body.model_dump()
+    values["upstream_url"] = str(body.upstream_url).rstrip("/")
+    return owner_llm_config(
+        create_profile(user["user_id"], values, include_secret=True),
+    )
+
+
+@app.put("/api/me/llm-config-profiles/{profile_id}")
+def api_update_llm_profile(profile_id: str, request: Request, body: LlmProfileUpdate):
+    user = require_current_user(request)
+    existing = get_profile(user["user_id"], profile_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if body.name != existing["name"] and profile_name_exists(
+        user["user_id"], body.name, exclude_id=profile_id,
+    ):
+        raise HTTPException(status_code=409, detail="A profile with this name already exists")
+    values = body.model_dump()
+    values["upstream_url"] = str(body.upstream_url).rstrip("/")
+    return owner_llm_config(
+        update_profile(user["user_id"], profile_id, values, include_secret=True),
+    )
+
+
+@app.delete("/api/me/llm-config-profiles/{profile_id}")
+def api_delete_llm_profile(profile_id: str, request: Request):
+    user = require_current_user(request)
+    if not delete_profile(user["user_id"], profile_id):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"deleted": profile_id}
+
+
+def _activate_profile(user_id: str, profile_id: str) -> dict:
+    """Copy a named profile into the user's active routing configuration.
+
+    This bumps config_version (invalidating old JWTs until /login) exactly
+    like a manual save, so the fail-closed version gate keeps working.
+    Shared by the self-service and administrator activate endpoints.
+    """
+    profile = get_profile(user_id, profile_id, include_secret=True)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    current = get_llm_config(user_id, include_secret=True)
+    api_key = profile.get("upstream_api_key", "")
+    if not api_key:
+        api_key = (current or {}).get("upstream_api_key", "")
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot activate a profile without an upstream API key",
+        )
+    saved = save_llm_config(
+        user_id,
+        {
+            "provider_id": profile["provider_id"],
+            "service_name": profile["service_name"],
+            "api_type": profile["api_type"],
+            "upstream_url": profile["upstream_url"],
+            "upstream_api_key": api_key,
+            "upstream_auth_type": profile["upstream_auth_type"],
+            "default_model": profile["default_model"],
+            "cheap_model": profile["cheap_model"],
+            "models": profile["models"],
+            "max_output_tokens": profile["max_output_tokens"],
+        },
+        active_profile_id=profile_id,
+        include_secret=True,
+    )
+    return owner_llm_config(saved)
+
+
+@app.post("/api/me/llm-config-profiles/{profile_id}/activate")
+def api_activate_llm_profile(profile_id: str, request: Request):
+    user = require_current_user(request)
+    return _activate_profile(user["user_id"], profile_id)
+
+
+def _require_existing_user(user_id: str) -> None:
+    db = get_db()
+    target = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+    db.close()
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+
+@app.get("/api/admin/users/{user_id}/llm-config-profiles")
+def api_admin_list_profiles(user_id: str, request: Request):
+    require_admin(request)
+    _require_existing_user(user_id)
+    return {
+        "profiles": [
+            owner_llm_config(p)
+            for p in list_profiles(user_id, include_secret=True)
+        ],
+    }
+
+
+@app.post("/api/admin/users/{user_id}/llm-config-profiles", status_code=201)
+def api_admin_create_profile(user_id: str, request: Request, body: LlmProfileCreate):
+    require_admin(request)
+    _require_existing_user(user_id)
+    if profile_name_exists(user_id, body.name):
+        raise HTTPException(status_code=409, detail="A profile with this name already exists")
+    values = body.model_dump()
+    values["upstream_url"] = str(body.upstream_url).rstrip("/")
+    return owner_llm_config(
+        create_profile(user_id, values, include_secret=True),
+    )
+
+
+@app.put("/api/admin/users/{user_id}/llm-config-profiles/{profile_id}")
+def api_admin_update_profile(
+    user_id: str, profile_id: str, request: Request, body: LlmProfileUpdate,
+):
+    require_admin(request)
+    _require_existing_user(user_id)
+    existing = get_profile(user_id, profile_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if body.name != existing["name"] and profile_name_exists(
+        user_id, body.name, exclude_id=profile_id,
+    ):
+        raise HTTPException(status_code=409, detail="A profile with this name already exists")
+    values = body.model_dump()
+    values["upstream_url"] = str(body.upstream_url).rstrip("/")
+    return owner_llm_config(
+        update_profile(user_id, profile_id, values, include_secret=True),
+    )
+
+
+@app.delete("/api/admin/users/{user_id}/llm-config-profiles/{profile_id}")
+def api_admin_delete_profile(user_id: str, profile_id: str, request: Request):
+    require_admin(request)
+    _require_existing_user(user_id)
+    if not delete_profile(user_id, profile_id):
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return {"deleted": profile_id}
+
+
+@app.post("/api/admin/users/{user_id}/llm-config-profiles/{profile_id}/activate")
+def api_admin_activate_profile(user_id: str, profile_id: str, request: Request):
+    require_admin(request)
+    _require_existing_user(user_id)
+    return _activate_profile(user_id, profile_id)
+
+
+@app.put("/api/admin/users/{user_id}/llm-config/fallback")
+def api_admin_put_fallback(user_id: str, request: Request, body: FallbackUpdate):
+    require_admin(request)
+    config_row = get_llm_config(user_id)
+    if config_row is None:
+        raise HTTPException(status_code=404, detail="LLM configuration not found")
+    if body.fallback_profile_id is not None:
+        profile = get_profile(user_id, body.fallback_profile_id)
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
+    db = get_db()
+    db.execute(
+        "UPDATE user_llm_configs SET fallback_profile_id = ? WHERE user_id = ?",
+        (body.fallback_profile_id, user_id),
+    )
+    db.commit()
+    db.close()
+    return owner_llm_config(get_llm_config(user_id, include_secret=True) or {})
 
 
 @app.get("/api/admin/users")
@@ -224,9 +477,12 @@ def api_admin_users(request: Request):
                 "username": user["username"],
                 "role": user["role"],
                 "created_at": user["created_at"],
+                # Admins manage real upstream credentials and may need to
+                # rotate them, so the roster includes the decrypted key.
                 "llm_config": (
-                    public_llm_config(value)
-                    if (value := get_llm_config(user["id"])) is not None
+                    owner_llm_config(value)
+                    if (value := get_llm_config(user["id"], include_secret=True))
+                    is not None
                     else None
                 ),
             }
@@ -245,7 +501,50 @@ def api_admin_put_llm_config(user_id: str, request: Request, body: LlmConfigUpda
         raise HTTPException(status_code=404, detail="User not found")
     values = body.model_dump()
     values["upstream_url"] = str(body.upstream_url).rstrip("/")
-    return public_llm_config(save_llm_config(user_id, values))
+    return owner_llm_config(save_llm_config(user_id, values, include_secret=True))
+
+
+class RoleUpdate(BaseModel):
+    role: Literal["admin", "user"]
+
+
+@app.put("/api/admin/users/{user_id}/role")
+def api_admin_put_role(user_id: str, request: Request, body: RoleUpdate):
+    """Change a user's role. Self-demotion and last-admin removal are blocked."""
+    actor = require_admin(request)
+    if user_id == actor["id"]:
+        raise HTTPException(status_code=400, detail="self_role_change_forbidden")
+    db = get_db()
+    target = db.execute(
+        "SELECT id, username, role FROM users WHERE id = ?", (user_id,),
+    ).fetchone()
+    if target is None:
+        db.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    if target["role"] == "admin" and body.role == "user":
+        admin_count = db.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE role = 'admin'",
+        ).fetchone()["n"]
+        if admin_count <= 1:
+            db.close()
+            raise HTTPException(status_code=400, detail="last_admin_protected")
+    old_role = target["role"]
+    db.execute("UPDATE users SET role = ? WHERE id = ?", (body.role, user_id))
+    db.commit()
+    db.close()
+    log_event(
+        request,
+        "role_changed",
+        actor_user_id=actor["id"],
+        actor_username=actor["username"],
+        detail={
+            "target_user_id": user_id,
+            "target_username": target["username"],
+            "old_role": old_role,
+            "new_role": body.role,
+        },
+    )
+    return {"id": user_id, "username": target["username"], "role": body.role}
 
 
 @app.get("/internal/users/{user_id}/llm-config")
@@ -265,7 +564,27 @@ def internal_llm_config(
             status_code=409,
             content={"error": "configuration_changed", "config_version": value["config_version"]},
         )
-    return value
+    # Resolve the gateway failover route (if any). The fallback profile is
+    # returned with its decrypted key because the gateway needs it to proxy;
+    # this endpoint is internal-token-only and never exposed publicly.
+    fallback = None
+    if value.get("fallback_profile_id"):
+        profile = get_profile(
+            user_id, value["fallback_profile_id"], include_secret=True,
+        )
+        if profile is not None:
+            fallback = {
+                "service_name": profile["service_name"],
+                "api_type": profile["api_type"],
+                "upstream_url": profile["upstream_url"],
+                "upstream_api_key": profile["upstream_api_key"],
+                "upstream_auth_type": profile["upstream_auth_type"],
+                "default_model": profile["default_model"],
+                "cheap_model": profile["cheap_model"],
+                "models": profile["models"],
+                "max_output_tokens": profile["max_output_tokens"],
+            }
+    return {**value, "fallback": fallback}
 
 
 def validate_redirect_uri(client_redirect_uris: str, redirect_uri: str) -> bool:

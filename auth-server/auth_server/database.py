@@ -169,6 +169,25 @@ def init_db() -> None:
             updated_at                 TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS llm_config_profiles (
+            id                         TEXT PRIMARY KEY,
+            user_id                    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            name                       TEXT NOT NULL,
+            provider_id                TEXT NOT NULL,
+            service_name               TEXT NOT NULL,
+            api_type                   TEXT NOT NULL,
+            upstream_url               TEXT NOT NULL,
+            upstream_api_key_encrypted TEXT NOT NULL DEFAULT '',
+            upstream_auth_type         TEXT NOT NULL,
+            default_model              TEXT NOT NULL,
+            cheap_model                TEXT NOT NULL,
+            models                     TEXT NOT NULL,
+            max_output_tokens          INTEGER NOT NULL,
+            created_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at                 TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(user_id, name)
+        );
+
         CREATE TABLE IF NOT EXISTS sessions (
             session_token TEXT PRIMARY KEY,
             user_id       TEXT NOT NULL REFERENCES users(id),
@@ -231,6 +250,25 @@ def init_db() -> None:
     }
     if "role" not in user_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+
+    # Link the active configuration to the profile it was activated from,
+    # and optionally to a fallback profile used by gateway failover.
+    llm_columns = {
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(user_llm_configs)").fetchall()
+    }
+    if "active_profile_id" not in llm_columns:
+        cursor.execute(
+            "ALTER TABLE user_llm_configs "
+            "ADD COLUMN active_profile_id TEXT REFERENCES llm_config_profiles(id) "
+            "ON DELETE SET NULL"
+        )
+    if "fallback_profile_id" not in llm_columns:
+        cursor.execute(
+            "ALTER TABLE user_llm_configs "
+            "ADD COLUMN fallback_profile_id TEXT REFERENCES llm_config_profiles(id) "
+            "ON DELETE SET NULL"
+        )
 
     # Seed default client (only if not exists). The redirect_uri registration
     # uses a port wildcard ("http://127.0.0.1:*") which the exact matcher

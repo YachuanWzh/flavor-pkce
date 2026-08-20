@@ -50,6 +50,10 @@ _public_key = None
 _routing_cache: dict[tuple[str, int], tuple[float, dict]] = {}
 _revoked_cache: dict[str, tuple[float, bool]] = {}
 
+# Circuit-breaker cooldowns for intelligent routing: (user_id, service_name)
+# → monotonic deadline until which the route is skipped after a failure.
+_route_cooldowns: dict[tuple[str, str], float] = {}
+
 
 async def _is_jti_revoked(jti: str) -> bool:
     """Ask the auth server whether this access-token jti was revoked.
@@ -534,39 +538,6 @@ async def proxy(request: Request, path: str):
         return routing_error
     assert routing is not None
 
-    # SSRF defense-in-depth (P0-7): re-validate user-controlled routing at the
-    # proxy layer too, so a routing entry from any source (cache, internal API)
-    # cannot target private/metadata addresses. The legacy fallback upstream
-    # is operator-configured (UPSTREAM_URL env) and is trusted, so it is exempt.
-    if routing.get("service_name") != "legacy-upstream":
-        if not validate_upstream_url(
-            str(routing.get("upstream_url", "")),
-            gateway.config.UPSTREAM_URL_ALLOWLIST,
-        ):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "upstream_url not allowed",
-                    "detail": "The configured upstream URL is not a public HTTP(S) endpoint",
-                },
-            )
-
-    # --- Build upstream request ---
-    upstream_url = (
-        f"{routing['upstream_url'].rstrip('/')}/{path.lstrip('/')}"
-    )
-    if request.url.query:
-        upstream_url += f"?{request.url.query}"
-
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    headers.pop("content-length", None)
-    _apply_upstream_auth(
-        headers,
-        routing.get("upstream_api_key", ""),
-        routing.get("upstream_auth_type", "x-api-key"),
-    )
-
     body = await request.body()
 
     # Capture the request body for audit logging.
@@ -575,127 +546,275 @@ async def proxy(request: Request, path: str):
     # Extract model name from request body early, before any upstream call.
     # Both OpenAI and Anthropic put it at the top-level "model" key.
     request.state.model = _extract_model(body)
-    request.state.service_name = routing.get("service_name")
     if not _is_model_allowed(body, routing):
         return JSONResponse(
             status_code=403,
             content={"error": "model_not_allowed", "model": request.state.model},
         )
 
+    # --- Intelligent routing: build the ordered candidate route list ---
+    candidates = _candidate_routes(routing)
+    # SSRF defense-in-depth (P0-7): validate every candidate target before use,
+    # so a routing entry from any source (cache, internal API) cannot target
+    # private/metadata addresses. The legacy fallback upstream is
+    # operator-configured (UPSTREAM_URL env) and trusted, so it is exempt.
+    for candidate in candidates:
+        if candidate.get("service_name") != "legacy-upstream":
+            if not validate_upstream_url(
+                str(candidate.get("upstream_url", "")),
+                gateway.config.UPSTREAM_URL_ALLOWLIST,
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "upstream_url not allowed",
+                        "detail": "The configured upstream URL is not a public HTTP(S) endpoint",
+                    },
+                )
+
+    # An explicit client preference is user consent to switch to that route
+    # even when the silent-switch compatibility check would reject it.
+    preferred = request.headers.get("x-gateway-preferred-route", "")
+    primary = routing
+    user_id = str(payload.get("sub", ""))
+
     upstream_start = time.perf_counter()
 
-    # --- Proxy ---
-    client = httpx.AsyncClient(timeout=300.0)
-    took_sse = False
+    # --- Proxy with intelligent routing / failover ---
+    #
+    # Candidates are tried in order (primary first, then the user-configured
+    # fallback route).  Failover happens only *before* any byte is returned
+    # to the client: connection errors and 5xx responses advance to the next
+    # route; once a response (including an SSE stream) is handed back, no
+    # retry is possible.
+    #
+    # Hybrid switch policy:
+    # - silent switch when the next route speaks the same api_type and serves
+    #   the requested model (response carries X-Gateway-Route);
+    # - otherwise a 409 ``route_switched`` error tells the client to ask the
+    #   user whether to continue; explicit consent comes back as the
+    #   X-Gateway-Preferred-Route header naming the target service.
+    for index, route in enumerate(candidates):
+        service_name = str(route.get("service_name", ""))
+        cooldown_key = (user_id, service_name)
+        # Circuit breaker: skip a recently failed route while alternatives
+        # exist.  With no alternative left we still attempt it (fail-closed
+        # behaviour is unchanged for single-route users).
+        if (
+            len(candidates) > 1
+            and gateway.config.FAILOVER_COOLDOWN_SECONDS > 0
+            and _route_cooldowns.get(cooldown_key, 0) > time.monotonic()
+        ):
+            continue
+        # Compatibility gate for every non-primary candidate.
+        if index > 0 and not _route_compatible(
+            primary, route, request.state.model,
+        ):
+            if preferred != service_name:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "route_switched",
+                        "message": (
+                            "The primary route failed and the backup route is "
+                            "not drop-in compatible. Ask the user whether to "
+                            "continue, then retry with "
+                            "X-Gateway-Preferred-Route set to the chosen "
+                            "service_name."
+                        ),
+                        "routes": [
+                            {
+                                "service_name": item.get("service_name"),
+                                "api_type": item.get("api_type"),
+                                "models": item.get("models") or [],
+                            }
+                            for item in candidates
+                        ],
+                    },
+                )
 
-    try:
-        resp = await client.send(
-            client.build_request(
-                method=request.method,
-                url=upstream_url,
-                headers=headers,
-                content=body,
-            ),
-            stream=True,
+        upstream_url = (
+            f"{route['upstream_url'].rstrip('/')}/{path.lstrip('/')}"
+        )
+        if request.url.query:
+            upstream_url += f"?{request.url.query}"
+
+        headers = dict(request.headers)
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+        headers.pop("x-gateway-preferred-route", None)
+        _apply_upstream_auth(
+            headers,
+            route.get("upstream_api_key", ""),
+            route.get("upstream_auth_type", "x-api-key"),
         )
 
-        content_type = resp.headers.get("content-type", "")
-        is_sse = "text/event-stream" in content_type
+        request.state.service_name = service_name
 
-        if is_sse:
-            took_sse = True
-            # The middleware must not audit-log this request: usage fields
-            # are only complete once the stream is drained (sse_generator).
-            request.state.defer_audit_log = True
-            # Forward SSE chunks to the client in real time while
-            # collecting them in the background for audit logging.
-            collected: list[bytes] = []
-            first_chunk_done = False
-            upstream_stream = resp.aiter_bytes()
-
-            async def sse_generator():
-                nonlocal first_chunk_done
-                try:
-                    async for chunk in upstream_stream:
-                        # Capture audit data on the fly.
-                        if not first_chunk_done:
-                            first_chunk_done = True
-                            request.state.prompt_tokens = (
-                                _extract_input_tokens_from_chunk(chunk)
-                            )
-                        collected.append(chunk)
-                        yield chunk
-                finally:
-                    # Finalise audit state after the stream is drained.
-                    combined = b"".join(collected)
-                    request.state.response_body = _decode_body(combined)
-                    # Usage events arrive late in the stream (Anthropic
-                    # message_delta / OpenAI final usage chunk); recover
-                    # them from the full buffered body now.
-                    _extract_usage_from_stream(request, combined)
-                    request.state.upstream_ms = (
-                        (time.perf_counter() - upstream_start) * 1000
-                    )
-                    await resp.aclose()
-                    await client.aclose()
-                    # Usage is final now — write the deferred audit log.
-                    _finalize_stream_audit_log(request)
-
-            resp_headers = _clean_response_headers(
-                dict(resp.headers), streaming=True,
-            )
-            status_code = resp.status_code
-            request.state.audit_status_code = status_code
-            if status_code >= 500:
+        client = httpx.AsyncClient(timeout=300.0)
+        took_sse = False
+        try:
+            try:
+                resp = await client.send(
+                    client.build_request(
+                        method=request.method,
+                        url=upstream_url,
+                        headers=headers,
+                        content=body,
+                    ),
+                    stream=True,
+                )
+            except httpx.HTTPError:
+                # Connection-level failure: eligible for failover.
                 UPSTREAM_ERRORS.labels(method=request.method, path=path).inc()
+                _mark_route_failed(cooldown_key)
+                continue
+            except Exception:
+                UPSTREAM_ERRORS.labels(
+                    method=request.method, path=path,
+                ).inc()
+                raise
 
-            return StreamingResponse(
-                sse_generator(),
+            if resp.status_code >= 500:
+                # Upstream signalled an outage: fail over before returning
+                # anything to the client.
+                UPSTREAM_ERRORS.labels(method=request.method, path=path).inc()
+                _mark_route_failed(cooldown_key)
+                await resp.aclose()
+                continue
+
+            # The route handled the request — lift any cooldown on it.
+            _route_cooldowns.pop(cooldown_key, None)
+
+            content_type = resp.headers.get("content-type", "")
+            is_sse = "text/event-stream" in content_type
+
+            if is_sse:
+                took_sse = True
+                # The middleware must not audit-log this request: usage fields
+                # are only complete once the stream is drained (sse_generator).
+                request.state.defer_audit_log = True
+                # Forward SSE chunks to the client in real time while
+                # collecting them in the background for audit logging.
+                collected: list[bytes] = []
+                first_chunk_done = False
+                upstream_stream = resp.aiter_bytes()
+
+                async def sse_generator():
+                    nonlocal first_chunk_done
+                    try:
+                        async for chunk in upstream_stream:
+                            # Capture audit data on the fly.
+                            if not first_chunk_done:
+                                first_chunk_done = True
+                                request.state.prompt_tokens = (
+                                    _extract_input_tokens_from_chunk(chunk)
+                                )
+                            collected.append(chunk)
+                            yield chunk
+                    finally:
+                        # Finalise audit state after the stream is drained.
+                        combined = b"".join(collected)
+                        request.state.response_body = _decode_body(combined)
+                        # Usage events arrive late in the stream (Anthropic
+                        # message_delta / OpenAI final usage chunk); recover
+                        # them from the full buffered body now.
+                        _extract_usage_from_stream(request, combined)
+                        request.state.upstream_ms = (
+                            (time.perf_counter() - upstream_start) * 1000
+                        )
+                        await resp.aclose()
+                        await client.aclose()
+                        # Usage is final now — write the deferred audit log.
+                        _finalize_stream_audit_log(request)
+
+                resp_headers = _clean_response_headers(
+                    dict(resp.headers), streaming=True,
+                )
+                resp_headers["X-Gateway-Route"] = _header_safe_route_name(service_name)
+                status_code = resp.status_code
+                request.state.audit_status_code = status_code
+
+                return StreamingResponse(
+                    sse_generator(),
+                    status_code=status_code,
+                    headers=resp_headers,
+                )
+
+            # Non-streaming — read entire body and extract full token usage.
+            content = await resp.aread()
+            request.state.response_body = _decode_body(content)
+            resp_headers = _clean_response_headers(
+                dict(resp.headers), streaming=False,
+            )
+            resp_headers["X-Gateway-Route"] = _header_safe_route_name(service_name)
+            status_code = resp.status_code
+            request.state.upstream_ms = (
+                (time.perf_counter() - upstream_start) * 1000
+            )
+            _extract_full_token_usage(request, content)
+
+            return Response(
+                content=content,
                 status_code=status_code,
                 headers=resp_headers,
             )
+        finally:
+            if not took_sse:
+                await client.aclose()
 
-        # Non-streaming — read entire body and extract full token usage.
-        content = await resp.aread()
-        request.state.response_body = _decode_body(content)
-        resp_headers = _clean_response_headers(
-            dict(resp.headers), streaming=False,
-        )
-        status_code = resp.status_code
-        if status_code >= 500:
-            UPSTREAM_ERRORS.labels(method=request.method, path=path).inc()
-        request.state.upstream_ms = (
-            (time.perf_counter() - upstream_start) * 1000
-        )
-        _extract_full_token_usage(request, content)
-
-        return Response(
-            content=content,
-            status_code=status_code,
-            headers=resp_headers,
-        )
-
-    except httpx.HTTPError:
-        UPSTREAM_ERRORS.labels(
-            method=request.method, path=path,
-        ).inc()
-        return JSONResponse(
-            status_code=502,
-            content={"error": "Upstream provider unreachable"},
-        )
-    except Exception:
-        UPSTREAM_ERRORS.labels(
-            method=request.method, path=path,
-        ).inc()
-        raise
-    finally:
-        if not took_sse:
-            await client.aclose()
+    # Every candidate route failed (or was cooling down with no alternative).
+    return JSONResponse(
+        status_code=502,
+        content={"error": "Upstream provider unreachable"},
+    )
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Intelligent routing helpers
 # ---------------------------------------------------------------------------
+
+def _candidate_routes(routing: dict) -> list[dict]:
+    """Ordered failover candidates: the active route, then its fallback."""
+    candidates = [routing]
+    fallback = routing.get("fallback")
+    if isinstance(fallback, dict) and fallback.get("upstream_url"):
+        candidates.append(fallback)
+    return candidates
+
+
+def _route_compatible(primary: dict, candidate: dict, model: str | None) -> bool:
+    """Silent-switch gate: same protocol and the model must be servable.
+
+    The hybrid strategy only switches transparently when the backup route is
+    drop-in compatible with the request; otherwise the client is asked.
+    """
+    if candidate.get("api_type") != primary.get("api_type"):
+        return False
+    models = candidate.get("models") or []
+    if not models:
+        return True
+    return model is None or model in models
+
+
+def _header_safe_route_name(name: str) -> str:
+    """Sanitize a user-controlled service_name for use in HTTP headers."""
+    return "".join(
+        ch for ch in str(name) if ord(ch) >= 32 and ch not in "\r\n"
+    )[:128]
+
+
+def _mark_route_failed(cooldown_key: tuple[str, str]) -> None:
+    """Start the circuit-breaker cooldown for a failed route."""
+    seconds = gateway.config.FAILOVER_COOLDOWN_SECONDS
+    if seconds > 0:
+        now = time.monotonic()
+        # Evict expired entries so the map cannot grow without bound on
+        # long-lived gateway processes.
+        for key in [k for k, deadline in _route_cooldowns.items() if deadline <= now]:
+            del _route_cooldowns[key]
+        _route_cooldowns[cooldown_key] = now + seconds
+
 
 def _clean_response_headers(headers: dict, *, streaming: bool = False) -> dict:
     """Strip hop-by-hop headers from the upstream response."""

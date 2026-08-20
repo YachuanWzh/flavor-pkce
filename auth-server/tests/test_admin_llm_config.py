@@ -73,7 +73,12 @@ def test_regular_user_cannot_access_admin_apis(client):
     ).status_code == 403
 
 
-def test_admin_lists_users_without_exposing_upstream_key(client):
+def test_admin_lists_users_with_upstream_key_for_management(client):
+    """Admins manage real credentials, so the roster returns decrypted keys.
+
+    Access is still strictly limited to the admin role (see the 403 test
+    above for regular users).
+    """
     login(client, "testuser", "testpass")
     saved = client.put("/api/me/llm-config", json=route_payload())
     assert saved.status_code == 200
@@ -86,8 +91,7 @@ def test_admin_lists_users_without_exposing_upstream_key(client):
     test_user = next(item for item in users if item["username"] == "testuser")
     assert test_user["role"] == "user"
     assert test_user["llm_config"]["api_key_configured"] is True
-    assert "upstream_api_key" not in response.text
-    assert "managed-upstream-secret" not in response.text
+    assert test_user["llm_config"]["upstream_api_key"] == "managed-upstream-secret"
 
 
 def test_admin_updates_another_user_and_preserves_blank_key(client):

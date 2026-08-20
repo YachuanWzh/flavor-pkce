@@ -38,6 +38,8 @@ auth-server/.pytest_cache/
 api-gateway/.pytest_cache/
 # Transient smoke-test log held open while the dev gateway runs
 api-gateway/smoke_gw.log
+# Local smoke-test fixtures and runner (dummy credentials only)
+.smoke/
 .pytest_cache/
 # superharness ralph runtime state (per-task tracking + retry)
 .claude/superharness/ralph/

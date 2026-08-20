@@ -276,14 +276,16 @@ class TestMetricsEndpoint:
 
             after = client.get("/metrics").text
 
-            # upstream_errors_total should have increased
+            # upstream_errors_total should have increased.  Match the exact
+            # label series for this request — other test modules may have
+            # created unrelated series (e.g. POST) that appear in the output.
             import re
-            before_match = re.search(
-                r"gateway_upstream_errors_total\{[^}]*\}\s+([\d.]+)", before
+            series = (
+                r'gateway_upstream_errors_total\{method="GET",'
+                r'path="v1/chat/completions"\}\s+([\d.]+)'
             )
-            after_match = re.search(
-                r"gateway_upstream_errors_total\{[^}]*\}\s+([\d.]+)", after
-            )
+            before_match = re.search(series, before)
+            after_match = re.search(series, after)
             before_val = float(before_match.group(1)) if before_match else 0.0
             after_val = float(after_match.group(1)) if after_match else 0.0
             assert after_val > before_val

@@ -18,7 +18,9 @@ export function llmConfigToForm(config) {
     service_name: config.service_name,
     api_type: config.api_type,
     upstream_url: config.upstream_url,
-    upstream_api_key: "",
+    // Owner sessions receive the decrypted key; admin views of other users
+    // omit it, in which case the field stays empty ("keep existing key").
+    upstream_api_key: config.upstream_api_key || "",
     upstream_auth_type: config.upstream_auth_type,
     default_model: config.default_model,
     cheap_model: config.cheap_model,

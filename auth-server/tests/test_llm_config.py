@@ -53,20 +53,21 @@ def sample_config(**overrides):
     return value
 
 
-def test_user_can_save_and_read_public_config_without_secret(client):
+def test_user_can_save_and_read_own_config_with_key(client):
+    """The owner's session reads the decrypted key back for form display."""
     login(client)
     initial_version = client.get("/api/me/llm-config").json()["config_version"]
     saved = client.put("/api/me/llm-config", json=sample_config())
     assert saved.status_code == 200
     assert saved.json()["config_version"] == initial_version + 1
+    assert saved.json()["upstream_api_key"] == "upstream-secret-value"
 
     response = client.get("/api/me/llm-config")
     assert response.status_code == 200
     body = response.json()
     assert body["service_name"] == "Enterprise DeepSeek"
     assert body["api_key_configured"] is True
-    assert "upstream_api_key" not in body
-    assert "upstream-secret-value" not in response.text
+    assert body["upstream_api_key"] == "upstream-secret-value"
 
     db = get_db()
     row = db.execute("SELECT upstream_api_key_encrypted FROM user_llm_configs").fetchone()
