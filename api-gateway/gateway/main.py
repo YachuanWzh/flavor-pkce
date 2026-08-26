@@ -93,7 +93,10 @@ async def _is_jti_revoked(jti: str) -> bool:
     return revoked
 
 # Path prefixes that the observability middleware should NOT audit-log.
-_AUDIT_SKIP_PREFIXES = ("/metrics", "/api/logs", "/api/stats", "/health", "/report")
+_AUDIT_SKIP_PREFIXES = (
+    "/metrics", "/api/logs", "/api/stats", "/api/query", "/api/agent",
+    "/health", "/report",
+)
 
 # Path to the static audit-viewer HTML page.
 _AUDIT_HTML_PATH = Path(__file__).parent / "web" / "logs.html"
@@ -417,6 +420,23 @@ def api_query(request: Request, body: QueryRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return result
+
+
+class AgentAskRequest(BaseModel):
+    question: str
+
+
+@app.post("/api/agent/ask")
+async def api_agent_ask(request: Request, body: AgentAskRequest):
+    """Translate a natural-language question to SQL and run it read-only."""
+    _require_audit_token(request)
+    from gateway.agent import ask_agent
+    try:
+        return await ask_agent(body.question)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream LLM error: {exc}")
 
 
 # ---------------------------------------------------------------------------
