@@ -90,6 +90,21 @@ def init_audit_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp);
         CREATE INDEX IF NOT EXISTS idx_audit_user      ON audit_logs("user");
         CREATE INDEX IF NOT EXISTS idx_audit_path      ON audit_logs(path);
+
+        CREATE VIEW IF NOT EXISTS v_audit_daily AS
+        SELECT
+            substr(timestamp, 1, 10) AS date,
+            COUNT(*) AS requests,
+            SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
+            ROUND(AVG(duration_ms), 2) AS avg_duration_ms,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+            COUNT(DISTINCT "user") AS users,
+            COUNT(DISTINCT model) AS models
+        FROM audit_logs
+        GROUP BY date
     """)
     # Migrate existing databases that lack newer columns.
     for col, col_type in (

@@ -75,3 +75,28 @@ def test_multi_statement_rejected():
 def test_non_whitelist_table_rejected():
     with pytest.raises(ValueError, match="not allowed"):
         execute_readonly_query("SELECT * FROM sqlite_master")
+
+
+def test_view_schema_and_aggregates():
+    from gateway.database import _connect
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT date, requests, errors, prompt_tokens, completion_tokens, "
+        "users, models FROM v_audit_daily ORDER BY date"
+    ).fetchall()
+    conn.close()
+    assert len(rows) >= 1
+    by_date = {r["date"]: r for r in rows}
+    assert by_date["2026-08-01"]["requests"] == 1
+    assert by_date["2026-08-01"]["errors"] == 0
+    assert by_date["2026-08-01"]["prompt_tokens"] == 150
+    assert by_date["2026-08-01"]["completion_tokens"] == 80
+    assert by_date["2026-08-01"]["users"] == 1
+    assert by_date["2026-08-01"]["models"] == 1
+
+
+def test_view_queryable_through_executor():
+    result = execute_readonly_query(
+        "SELECT COUNT(*) AS n FROM v_audit_daily"
+    )
+    assert result["rows"][0]["n"] >= 1
