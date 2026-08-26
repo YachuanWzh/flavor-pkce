@@ -13,7 +13,9 @@ export default function AgentPage() {
     setError("");
     setResult(null);
     try {
-      const resp = await fetch("/api/agent/ask", {
+      // In production the gateway sits behind the /gw path prefix (Caddy);
+      // in dev, vite proxies /gw to the gateway and strips the prefix.
+      const resp = await fetch("/gw/api/agent/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",

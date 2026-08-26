@@ -4,7 +4,9 @@ import * as echarts from "echarts";
 const PALETTE = ["#5b8def", "#34d399", "#f87171", "#fbbf24", "#a78bfa", "#22d3ee"];
 
 async function fetchStats(path) {
-  const resp = await fetch(`/api/stats/${path}`, { credentials: "include" });
+  // In production the gateway sits behind the /gw path prefix (Caddy); in
+  // dev, vite proxies /gw to the gateway and strips the prefix.
+  const resp = await fetch(`/gw/api/stats/${path}`, { credentials: "include" });
   if (resp.status === 401) throw new Error("Sign in as an administrator");
   if (resp.status === 403) throw new Error("Administrator access required");
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -67,12 +69,12 @@ export default function DashboardPage() {
       if (endDate) params.set("end_date", endDate);
       const qs = params.toString();
       const suffix = qs ? `?${qs}` : "";
-      const modelQs = qs ? `&${qs}` : `?${qs}`;
+      const extra = qs ? `&${qs}` : "";
       const [tokens, requests, models, users, cache] = await Promise.all([
         fetchStats(`tokens${suffix}`),
         fetchStats(`requests${suffix}`),
-        fetchStats(`models?limit=10${modelQs}`),
-        fetchStats(`tokens?group_by=user${modelQs}`),
+        fetchStats(`models?limit=10${extra}`),
+        fetchStats(`tokens?group_by=user${extra}`),
         fetchStats(`cache${suffix}`),
       ]);
       setData({ tokens, requests, models, users, cache });
