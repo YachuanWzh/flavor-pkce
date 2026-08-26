@@ -414,11 +414,14 @@ def api_query(request: Request, body: QueryRequest):
     tables/views and a single SELECT are allowed; rows are capped.
     """
     _require_audit_token(request)
+    import sqlite3
     try:
         from gateway.query import execute_readonly_query
         result = execute_readonly_query(body.sql)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=400, detail=f"Query failed: {exc}")
     return result
 
 

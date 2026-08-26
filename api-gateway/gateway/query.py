@@ -58,6 +58,31 @@ _FORBIDDEN_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# SQLite authorizer action codes (sqlite3.h).
+_SQLITE_OK = 0
+_SQLITE_DENY = 1
+_SQLITE_READ = 20
+
+
+def _table_authorizer(action, arg1, arg2, arg3, arg4):
+    """Engine-level allowlist: deny reads of any non-whitelisted table.
+
+    This is the authoritative check — it catches every way a query can
+    reference a table (comma lists, subqueries, JOINs, etc.), which the
+    regex-based ``_extract_tables`` heuristic cannot fully guarantee.
+
+    Note: for SQLITE_READ, Python's sqlite3 passes the *table* name as
+    ``arg1`` and the *column* name as ``arg2`` (verified empirically), the
+    reverse of what the C API docs suggest — the C API's (database_name,
+    table_name, column_name) ordering is not preserved in the Python 5-arg
+    callback for the READ action.
+    """
+    if action == _SQLITE_READ:
+        table = (arg1 or "").lower()
+        if table and table not in ALLOWED_TABLES:
+            return _SQLITE_DENY
+    return _SQLITE_OK
+
 
 def _extract_tables(sql: str) -> set[str]:
     """Best-effort extraction of referenced tables from a SELECT statement."""
@@ -115,11 +140,21 @@ def execute_readonly_query(sql: str, max_rows: int = MAX_ROWS) -> dict:
         f"file:{gateway.config.AUDIT_DB_PATH}?mode=ro", uri=True
     )
     conn.row_factory = sqlite3.Row
+    conn.set_authorizer(_table_authorizer)
     conn.execute("PRAGMA query_only = ON")
     try:
-        cur = conn.execute(sql)
-        cols = [d[0] for d in cur.description or []]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        try:
+            cur = conn.execute(sql)
+            cols = [d[0] for d in cur.description or []]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        except sqlite3.DatabaseError as exc:
+            # Authorizer denials surface as DatabaseError; map them to the
+            # same ValueError contract the API layer turns into a 400.
+            # Other DB errors (e.g. SQL syntax errors) keep their type so
+            # the API layer can still report them distinctly.
+            if "prohibited" in str(exc).lower():
+                raise ValueError(f"Table/view not allowed: {exc}") from exc
+            raise
     finally:
         conn.close()
 

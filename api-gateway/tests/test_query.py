@@ -1,6 +1,7 @@
 """Read-only SQL query executor tests (data agent backend)."""
 
 import os
+import sqlite3
 import tempfile
 
 import pytest
@@ -75,6 +76,29 @@ def test_multi_statement_rejected():
 def test_non_whitelist_table_rejected():
     with pytest.raises(ValueError, match="not allowed"):
         execute_readonly_query("SELECT * FROM sqlite_master")
+
+
+def test_comma_joined_non_whitelist_table_rejected():
+    # Regression: comma-separated FROM list used to bypass the allowlist.
+    with pytest.raises(ValueError, match="not allowed"):
+        execute_readonly_query("SELECT name FROM audit_logs, sqlite_master")
+
+
+def test_subquery_non_whitelist_table_rejected():
+    with pytest.raises(ValueError, match="not allowed"):
+        execute_readonly_query("SELECT * FROM audit_logs WHERE id IN (SELECT id FROM sqlite_master)")
+
+
+def test_join_non_whitelist_table_rejected():
+    with pytest.raises(ValueError, match="not allowed"):
+        execute_readonly_query("SELECT * FROM audit_logs JOIN sqlite_master ON 1=1")
+
+
+def test_syntax_error_raises_valuable_error():
+    # sqlite3.OperationalError for malformed SQL should surface as a clear
+    # error the API layer can map to a 400, not an unhandled 500.
+    with pytest.raises(sqlite3.Error):
+        execute_readonly_query("SELECT * FROM")
 
 
 def test_view_schema_and_aggregates():

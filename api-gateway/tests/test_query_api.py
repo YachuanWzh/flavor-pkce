@@ -90,3 +90,10 @@ def test_bad_schema_rejected(client):
 def test_missing_sql_field(client):
     resp = client.post("/api/query", headers=AUTH, json={})
     assert resp.status_code == 422
+
+
+def test_syntax_error_returns_400(client):
+    # Regression: malformed SQL used to surface as an unhandled 500.
+    resp = client.post("/api/query", headers=AUTH, json={"sql": "SELECT * FROM"})
+    assert resp.status_code == 400
+    assert "Query failed" in resp.json()["detail"]

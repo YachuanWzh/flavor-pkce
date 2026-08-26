@@ -44,6 +44,11 @@ def test_extract_sql_none():
     assert _extract_sql_from_response("Sorry, I cannot answer that.") is None
 
 
+def test_extract_sql_none_content():
+    # Regression: an upstream model returning null content must not 500.
+    assert _extract_sql_from_response(None) is None
+
+
 class _FakeResponse:
     def __init__(self, status_code: int, json_body: dict):
         self.status_code = status_code

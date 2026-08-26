@@ -32,8 +32,10 @@ Rules:
 """.format(**SCHEMA_DESCRIPTIONS)
 
 
-def _extract_sql_from_response(text: str) -> str | None:
+def _extract_sql_from_response(text: str | None) -> str | None:
     """Pull a single SELECT statement out of a model response."""
+    if not text:
+        return None
     m = re.search(r"```(?:sql)?\s*(SELECT[\s\S]*?)```", text, re.IGNORECASE)
     if m:
         return m.group(1).strip().rstrip(";")
