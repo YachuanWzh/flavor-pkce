@@ -189,6 +189,36 @@ def owner_llm_config(value: dict) -> dict:
     return {key: item for key, item in value.items() if key != "user_id"}
 
 
+def owner_llm_config_response(user: dict, value: dict) -> JSONResponse:
+    """Return an owner config and refresh the browser SSO routing version."""
+    db = get_db()
+    current = db.execute(
+        "SELECT role FROM users WHERE id = ?", (user["user_id"],),
+    ).fetchone()
+    db.close()
+    if current is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    access_token = create_jwt(
+        sub=user["user_id"],
+        client_id="flavor-code-cli",
+        scope="",
+        username=user["username"],
+        config_version=value["config_version"],
+        role=current["role"],
+    )
+    response = JSONResponse(content=owner_llm_config(value))
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        max_age=259200,
+        samesite="lax",
+        secure=server_config.COOKIE_SECURE,
+    )
+    return response
+
+
 @app.get("/api/me")
 def api_me(request: Request):
     user = require_current_user(request)
@@ -221,7 +251,7 @@ def api_put_llm_config(request: Request, body: LlmConfigUpdate):
     values = body.model_dump()
     values["upstream_url"] = str(body.upstream_url).rstrip("/")
     saved = save_llm_config(user["user_id"], values, include_secret=True)
-    return owner_llm_config(saved)
+    return owner_llm_config_response(user, saved)
 
 
 class FallbackUpdate(BaseModel):
@@ -370,7 +400,8 @@ def _activate_profile(user_id: str, profile_id: str) -> dict:
 @app.post("/api/me/llm-config-profiles/{profile_id}/activate")
 def api_activate_llm_profile(profile_id: str, request: Request):
     user = require_current_user(request)
-    return _activate_profile(user["user_id"], profile_id)
+    saved = _activate_profile(user["user_id"], profile_id)
+    return owner_llm_config_response(user, saved)
 
 
 def _require_existing_user(user_id: str) -> None:
@@ -759,11 +790,15 @@ def login(
     # browser can authenticate to the API gateway (same domain in production)
     # without typing a secret. HttpOnly + SameSite=Lax keeps it out of JS.
     role = user["role"] if user["role"] else "user"
+    llm_config = get_llm_config(user["id"])
     access_token = create_jwt(
         sub=user["id"],
         client_id="flavor-code-cli",
         scope="",
         username=user["username"],
+        config_version=(
+            llm_config["config_version"] if llm_config is not None else None
+        ),
         role=role,
     )
 

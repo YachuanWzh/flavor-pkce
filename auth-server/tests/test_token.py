@@ -119,6 +119,33 @@ def test_token_exchange_success(client):
     assert decoded["role"] == "user"
 
 
+def test_browser_login_cookie_carries_llm_config_version(client):
+    """The SSO cookie must route /agent through the user's saved LLM config."""
+    resp = client.post(
+        "/login",
+        data={"username": "testuser", "password": "testpass"},
+    )
+
+    assert resp.status_code == 200
+    access_token = resp.cookies.get("access_token")
+    assert access_token
+
+    import jwt
+    decoded = jwt.decode(access_token, options={"verify_signature": False})
+    db = get_db()
+    expected = db.execute(
+        """SELECT c.config_version
+           FROM user_llm_configs c
+           JOIN users u ON u.id = c.user_id
+           WHERE u.username = ?""",
+        ("testuser",),
+    ).fetchone()
+    db.close()
+
+    assert expected is not None
+    assert decoded["config_version"] == expected["config_version"]
+
+
 def test_token_exchange_wrong_code_verifier(client):
     """POST /token with wrong code_verifier should return 400."""
     code, _, _ = complete_authorization_flow(client)

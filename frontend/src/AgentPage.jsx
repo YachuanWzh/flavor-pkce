@@ -22,7 +22,9 @@ export default function AgentPage() {
         body: JSON.stringify({ question }),
       });
       const data = await resp.json();
-      if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+      if (!resp.ok) throw new Error(
+        data.detail || data.message || data.error || `HTTP ${resp.status}`,
+      );
       setResult(data);
     } catch (cause) {
       setError(cause.message);

@@ -1,0 +1,19 @@
+# 本地开发 Caddy 反代：与生产拓扑一致（无 TLS）。
+#   宿主机 8080 -> Caddy 容器 :80
+#     /gw/*  -> api-gateway:8092（strip /gw 前缀）
+#     /*     -> auth-server:8091（SPA + OAuth）
+# 这样前端 SPA 与网关 API 同源，dashboard/data agent 可用。
+
+:80 {
+	# --- api-gateway under /gw/* (strip prefix before proxying) ---
+	handle_path /gw/* {
+		reverse_proxy api-gateway:8092
+		encode gzip
+	}
+
+	# --- auth-server at root (SPA + OAuth) ---
+	handle {
+		reverse_proxy auth-server:8091
+		encode gzip
+	}
+}

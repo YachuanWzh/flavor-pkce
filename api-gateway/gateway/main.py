@@ -431,11 +431,19 @@ class AgentAskRequest(BaseModel):
 
 @app.post("/api/agent/ask")
 async def api_agent_ask(request: Request, body: AgentAskRequest):
-    """Translate a natural-language question to SQL and run it read-only."""
-    _require_audit_token(request)
+    """Translate a natural-language question to SQL and run it read-only.
+
+    Uses the signed-in user's own LLM config (resolved from the JWT, the
+    same way the proxy resolves routing) so the agent speaks to the
+    upstream with the user's credentials, not the gateway-wide env key.
+    """
+    payload = _require_audit_token(request)
+    routing, err = await _resolve_user_routing(payload)
+    if err is not None:
+        return err
     from gateway.agent import ask_agent
     try:
-        return await ask_agent(body.question)
+        return await ask_agent(body.question, routing=routing)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except httpx.HTTPError as exc:

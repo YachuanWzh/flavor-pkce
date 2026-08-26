@@ -155,6 +155,23 @@ def test_activate_profile_copies_to_active_config_and_bumps_version(client):
     assert current["active_profile_id"] == created["id"]
 
 
+def test_activating_own_profile_refreshes_sso_cookie_version(client):
+    login_testuser(client)
+    created = client.post(
+        "/api/me/llm-config-profiles", json=profile_payload(),
+    ).json()
+    response = client.post(
+        f"/api/me/llm-config-profiles/{created['id']}/activate",
+    )
+    assert response.status_code == 200
+
+    access_token = response.cookies.get("access_token")
+    assert access_token
+    import jwt
+    decoded = jwt.decode(access_token, options={"verify_signature": False})
+    assert decoded["config_version"] == response.json()["config_version"]
+
+
 def test_activate_missing_profile_404(client):
     login_testuser(client)
     response = client.post("/api/me/llm-config-profiles/missing/activate")

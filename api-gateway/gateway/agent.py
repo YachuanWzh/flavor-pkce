@@ -45,23 +45,95 @@ def _extract_sql_from_response(text: str | None) -> str | None:
     return None
 
 
-async def _call_upstream(question: str) -> str:
-    """Call the gateway's configured upstream LLM (OpenAI-compatible)."""
-    url = f"{gateway.config.UPSTREAM_URL.rstrip('/')}/chat/completions"
+_ANTHROPIC_SUFFIX = "/anthropic"
+
+
+def _apply_upstream_auth(headers: dict, api_key: str, auth_type: str) -> None:
+    """Apply the upstream credential the same way the gateway proxy does
+    (gateway.main._apply_upstream_auth): bearer / api-key / x-api-key."""
+    if not api_key:
+        return
+    if auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif auth_type == "api-key":
+        headers["api-key"] = api_key
+    else:
+        headers["x-api-key"] = api_key
+
+
+def _routing_config(routing: dict | None) -> dict:
+    """Resolve upstream call config: the signed-in user's LLM config when
+    provided, otherwise the gateway-wide UPSTREAM_* env config."""
+    if routing:
+        return {
+            "upstream_url": str(routing.get("upstream_url") or gateway.config.UPSTREAM_URL),
+            "upstream_api_key": str(routing.get("upstream_api_key") or gateway.config.UPSTREAM_API_KEY),
+            "upstream_auth_type": str(routing.get("upstream_auth_type") or gateway.config.UPSTREAM_AUTH_TYPE),
+            "default_model": str(routing.get("default_model") or gateway.config.UPSTREAM_MODEL),
+            "api_type": str(routing.get("api_type") or ""),
+        }
+    return {
+        "upstream_url": gateway.config.UPSTREAM_URL,
+        "upstream_api_key": gateway.config.UPSTREAM_API_KEY,
+        "upstream_auth_type": gateway.config.UPSTREAM_AUTH_TYPE,
+        "default_model": gateway.config.UPSTREAM_MODEL,
+        "api_type": "",
+    }
+
+
+async def _call_upstream(question: str, routing: dict | None = None) -> str:
+    """Call the signed-in user's (or gateway's) configured upstream LLM.
+
+    OpenAI-compatible /chat/completions by default, and the Anthropic
+    Messages API when the user's api_type is anthropic or the upstream URL
+    points at an Anthropic-compatible base (e.g.
+    https://api.deepseek.com/anthropic with x-api-key auth).
+    """
+    cfg = _routing_config(routing)
+    base = cfg["upstream_url"].rstrip("/")
+    auth_type = cfg["upstream_auth_type"]
+    api_key = cfg["upstream_api_key"]
+    model = cfg["default_model"]
+
+    if cfg["api_type"].lower() == "anthropic" or base.endswith(_ANTHROPIC_SUFFIX):
+        headers = {
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 1024,
+            "system": _SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": question}],
+        }
+        _apply_upstream_auth(headers, api_key, auth_type)
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{base}/v1/messages", headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        try:
+            return "".join(
+                block.get("text", "")
+                for block in data.get("content", [])
+                if block.get("type") == "text"
+            )
+        except (KeyError, IndexError, TypeError):
+            raise ValueError("Upstream LLM returned an unexpected response")
+
+    headers = {"Content-Type": "application/json"}
     payload = {
-        "model": "default",
+        "model": model,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": question},
         ],
         "temperature": 0,
     }
-    headers = {"Content-Type": "application/json"}
-    if gateway.config.UPSTREAM_API_KEY:
-        headers["Authorization"] = f"Bearer {gateway.config.UPSTREAM_API_KEY}"
+    _apply_upstream_auth(headers, api_key, auth_type)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, headers=headers, json=payload)
+        resp = await client.post(f"{base}/chat/completions", headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
     try:
@@ -70,11 +142,16 @@ async def _call_upstream(question: str) -> str:
         raise ValueError("Upstream LLM returned an unexpected response")
 
 
-async def ask_agent(question: str, max_rows: int = 100) -> dict:
-    """Translate a question to SQL, execute it read-only, return results."""
+async def ask_agent(question: str, routing: dict | None = None, max_rows: int = 100) -> dict:
+    """Translate a question to SQL, execute it read-only, return results.
+
+    ``routing`` is the signed-in user's LLM config (upstream_url / api key /
+    auth type / default model). When omitted, the gateway-wide UPSTREAM_*
+    env config is used (legacy fallback).
+    """
     if not question or not question.strip():
         raise ValueError("Question is empty")
-    content = await _call_upstream(question)
+    content = await _call_upstream(question, routing)
     sql = _extract_sql_from_response(content)
     if sql is None:
         raise ValueError("Could not extract SQL from the model response")

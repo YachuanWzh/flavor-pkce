@@ -22,6 +22,8 @@ JWT_PUBLIC_KEY_PATH = os.environ.get(
 UPSTREAM_URL = os.environ.get("UPSTREAM_URL", "https://api.openai.com")
 UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "")
 UPSTREAM_AUTH_TYPE = os.environ.get("UPSTREAM_AUTH_TYPE", "x-api-key").lower()
+# Model name sent by the data agent when it calls the upstream LLM.
+UPSTREAM_MODEL = os.environ.get("UPSTREAM_MODEL", "default")
 
 # Operator-approved upstream hosts (hostnames or literal IPs, comma-separated)
 # that bypass the outbound SSRF check (P0-7). Use for on-prem/private LLM

@@ -76,6 +76,18 @@ def test_user_can_save_and_read_own_config_with_key(client):
     assert "upstream-secret-value" not in row["upstream_api_key_encrypted"]
 
 
+def test_saving_own_config_refreshes_sso_cookie_version(client):
+    login(client)
+    saved = client.put("/api/me/llm-config", json=sample_config())
+    assert saved.status_code == 200
+
+    access_token = saved.cookies.get("access_token")
+    assert access_token
+    import jwt
+    decoded = jwt.decode(access_token, options={"verify_signature": False})
+    assert decoded["config_version"] == saved.json()["config_version"]
+
+
 def test_update_preserves_key_and_increments_version(client):
     login(client)
     first = client.put("/api/me/llm-config", json=sample_config())

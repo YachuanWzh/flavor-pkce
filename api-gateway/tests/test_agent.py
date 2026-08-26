@@ -13,6 +13,15 @@ from gateway.database import init_audit_db, insert_log
 
 
 @pytest.fixture(autouse=True)
+def fixed_upstream(monkeypatch):
+    """Pin upstream config so tests do not depend on api-gateway/.env."""
+    monkeypatch.setattr(config, "UPSTREAM_URL", "https://api.openai.com/v1")
+    monkeypatch.setattr(config, "UPSTREAM_AUTH_TYPE", "bearer")
+    monkeypatch.setattr(config, "UPSTREAM_API_KEY", "")
+    monkeypatch.setattr(config, "UPSTREAM_MODEL", "default")
+
+
+@pytest.fixture(autouse=True)
 def setup_db():
     fd, tmp = tempfile.mkstemp(suffix=".db", prefix="agent_test_")
     os.close(fd)
@@ -53,6 +62,7 @@ class _FakeResponse:
     def __init__(self, status_code: int, json_body: dict):
         self.status_code = status_code
         self._json_body = json_body
+        self.calls: list[dict] = []
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -73,6 +83,7 @@ class _FakeResponse:
 
 def _fake_post(fake: _FakeResponse):
     async def fake_post(self, url, *, headers=None, json=None, timeout=None):
+        fake.calls.append({"url": url, "headers": headers or {}, "json": json})
         return fake
     return fake_post
 
@@ -109,3 +120,109 @@ def test_ask_agent_upstream_error_raises():
     with patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)):
         with pytest.raises(Exception):
             asyncio.run(ask_agent("anything"))
+
+
+def test_ask_agent_anthropic_upstream_uses_messages_api(monkeypatch):
+    """Regression: DeepSeek /anthropic base + x-api-key must use the
+    Anthropic Messages API (not OpenAI /chat/completions with Bearer)."""
+    monkeypatch.setattr(config, "UPSTREAM_URL", "https://api.deepseek.com/anthropic")
+    monkeypatch.setattr(config, "UPSTREAM_AUTH_TYPE", "x-api-key")
+    monkeypatch.setattr(config, "UPSTREAM_API_KEY", "sk-test")
+    monkeypatch.setattr(config, "UPSTREAM_MODEL", "deepseek-chat")
+    fake = _FakeResponse(200, {
+        "content": [{"type": "text", "text": '```sql\nSELECT "user", COUNT(*) AS n FROM audit_logs GROUP BY "user"\n```'}]
+    })
+    with patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)):
+        result = asyncio.run(ask_agent("How many requests per user?"))
+
+    call = fake.calls[-1]
+    assert call["url"] == "https://api.deepseek.com/anthropic/v1/messages"
+    assert call["headers"].get("x-api-key") == "sk-test"
+    assert "Authorization" not in call["headers"]
+    assert call["json"]["model"] == "deepseek-chat"
+    assert "system" in call["json"] and call["json"]["system"]
+    assert call["json"]["messages"] == [{"role": "user", "content": "How many requests per user?"}]
+    assert result["columns"] == ["user", "n"]
+    assert result["rows"] == [{"user": "alice", "n": 1}]
+
+
+def test_ask_agent_openai_upstream_bearer_auth(monkeypatch):
+    monkeypatch.setattr(config, "UPSTREAM_URL", "https://api.openai.com/v1")
+    monkeypatch.setattr(config, "UPSTREAM_AUTH_TYPE", "bearer")
+    monkeypatch.setattr(config, "UPSTREAM_API_KEY", "sk-test")
+    monkeypatch.setattr(config, "UPSTREAM_MODEL", "gpt-4o-mini")
+    fake = _FakeResponse(200, {
+        "choices": [{"message": {"content": "SELECT COUNT(*) AS n FROM audit_logs"}}]
+    })
+    with patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)):
+        result = asyncio.run(ask_agent("how many?"))
+
+    call = fake.calls[-1]
+    assert call["url"] == "https://api.openai.com/v1/chat/completions"
+    assert call["headers"].get("Authorization") == "Bearer sk-test"
+    assert call["json"]["model"] == "gpt-4o-mini"
+    assert result["columns"] == ["n"]
+
+
+def test_ask_agent_openai_upstream_x_api_key_auth(monkeypatch):
+    monkeypatch.setattr(config, "UPSTREAM_URL", "https://api.deepseek.com")
+    monkeypatch.setattr(config, "UPSTREAM_AUTH_TYPE", "x-api-key")
+    monkeypatch.setattr(config, "UPSTREAM_API_KEY", "sk-test")
+    monkeypatch.setattr(config, "UPSTREAM_MODEL", "deepseek-chat")
+    fake = _FakeResponse(200, {
+        "choices": [{"message": {"content": "SELECT COUNT(*) AS n FROM audit_logs"}}]
+    })
+    with patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)):
+        result = asyncio.run(ask_agent("how many?"))
+
+    call = fake.calls[-1]
+    assert call["url"] == "https://api.deepseek.com/chat/completions"
+    assert call["headers"].get("x-api-key") == "sk-test"
+    assert "Authorization" not in call["headers"]
+    assert result["columns"] == ["n"]
+
+
+def test_ask_agent_uses_user_routing():
+    """Agent must use the signed-in user's LLM config (routing dict), not the
+    gateway-wide UPSTREAM_* env config."""
+    routing = {
+        "upstream_url": "https://api.deepseek.com/anthropic",
+        "upstream_api_key": "user-secret-key",
+        "upstream_auth_type": "x-api-key",
+        "default_model": "user-model",
+        "api_type": "anthropic",
+    }
+    fake = _FakeResponse(200, {
+        "content": [{"type": "text", "text": "SELECT COUNT(*) AS n FROM audit_logs"}]
+    })
+    with patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)):
+        result = asyncio.run(ask_agent("how many?", routing=routing))
+
+    call = fake.calls[-1]
+    assert call["url"] == "https://api.deepseek.com/anthropic/v1/messages"
+    assert call["headers"].get("x-api-key") == "user-secret-key"
+    assert "Authorization" not in call["headers"]
+    assert call["json"]["model"] == "user-model"
+    assert result["columns"] == ["n"]
+
+
+def test_ask_agent_user_routing_openai_profile():
+    """User routing with an OpenAI api_type must hit /chat/completions."""
+    routing = {
+        "upstream_url": "https://gateway.example.com/v1",
+        "upstream_api_key": "user-openai-key",
+        "upstream_auth_type": "bearer",
+        "default_model": "user-gpt",
+        "api_type": "openai",
+    }
+    fake = _FakeResponse(200, {
+        "choices": [{"message": {"content": "SELECT COUNT(*) AS n FROM audit_logs"}}]
+    })
+    with patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)):
+        result = asyncio.run(ask_agent("how many?", routing=routing))
+
+    call = fake.calls[-1]
+    assert call["url"] == "https://gateway.example.com/v1/chat/completions"
+    assert call["headers"].get("Authorization") == "Bearer user-openai-key"
+    assert call["json"]["model"] == "user-gpt"
+    assert result["columns"] == ["n"]
