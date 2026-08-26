@@ -49,3 +49,5 @@ api-gateway/smoke_gw.log
 .superharness/
 
 .worktrees/
+# superharness ralph runtime state (per-task tracking + retry)
+.flavor/superharness/ralph/

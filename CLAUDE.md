@@ -9,6 +9,8 @@ marketplace at `.claude/superharness` (enabled in `.claude/settings.json` via
 engineering work.
 
 - Run a task end-to-end: `/superharness:go <task goal>`
+- Small focused change (lighter go, no worktree/plan-file/ralph overhead):
+  `/superharness:light <task goal>`
 - Brainstorm with a live browser mind map (manual trigger only):
   `/superharness:brainstorm <topic>`
 - Non-negotiable: strict TDD (failing test first), systematic debugging, and
