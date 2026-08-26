@@ -8,7 +8,9 @@ credential (UPSTREAM_URL / UPSTREAM_API_KEY), so the agent speaks to the
 same providers the gateway trusts.
 """
 
+import json
 import re
+from collections.abc import AsyncIterator
 
 import httpx
 
@@ -140,6 +142,103 @@ async def _call_upstream(question: str, routing: dict | None = None) -> str:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         raise ValueError("Upstream LLM returned an unexpected response")
+
+
+async def _stream_upstream(
+    question: str, routing: dict | None = None,
+) -> AsyncIterator[str]:
+    """Yield text deltas from Anthropic- or OpenAI-compatible SSE streams."""
+    cfg = _routing_config(routing)
+    base = cfg["upstream_url"].rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    _apply_upstream_auth(
+        headers, cfg["upstream_api_key"], cfg["upstream_auth_type"],
+    )
+
+    is_anthropic = (
+        cfg["api_type"].lower() == "anthropic"
+        or base.endswith(_ANTHROPIC_SUFFIX)
+    )
+    if is_anthropic:
+        headers["anthropic-version"] = "2023-06-01"
+        url = f"{base}/v1/messages"
+        payload = {
+            "model": cfg["default_model"],
+            "max_tokens": 1024,
+            "system": _SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": question}],
+            "stream": True,
+        }
+    else:
+        url = f"{base}/chat/completions"
+        payload = {
+            "model": cfg["default_model"],
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            "temperature": 0,
+            "stream": True,
+        }
+
+    timeout = httpx.Timeout(30.0, read=300.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST", url, headers=headers, json=payload,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw or raw == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                text = ""
+                if is_anthropic:
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text") or ""
+                else:
+                    choices = event.get("choices") or []
+                    if choices:
+                        text = (choices[0].get("delta") or {}).get("content") or ""
+                if text:
+                    yield text
+
+
+async def stream_agent(
+    question: str, routing: dict | None = None, max_rows: int = 100,
+) -> AsyncIterator[dict]:
+    """Stream model deltas, then execute and emit the completed SQL result."""
+    if not question or not question.strip():
+        raise ValueError("Question is empty")
+
+    yield {
+        "event": "status",
+        "data": {"stage": "generating", "message": "Generating SQL…"},
+    }
+    parts: list[str] = []
+    async for text in _stream_upstream(question, routing):
+        parts.append(text)
+        yield {"event": "delta", "data": {"text": text}}
+
+    sql = _extract_sql_from_response("".join(parts))
+    if sql is None:
+        raise ValueError("Could not extract SQL from the model response")
+
+    yield {"event": "sql", "data": {"sql": sql}}
+    yield {
+        "event": "status",
+        "data": {"stage": "executing", "message": "Executing read-only query…"},
+    }
+    result = execute_readonly_query(sql, max_rows=max_rows)
+    yield {"event": "result", "data": {"sql": sql, **result}}
+    yield {"event": "done", "data": {}}
 
 
 async def ask_agent(question: str, routing: dict | None = None, max_rows: int = 100) -> dict:

@@ -159,6 +159,7 @@ def test_ask_uses_signed_in_users_llm_config(client):
 
     with (
         patch("gateway.main.httpx.AsyncClient.get", new=fake_get),
+        patch("gateway.main.validate_upstream_url", return_value=True),
         patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)),
     ):
         resp = client.post(
@@ -172,3 +173,41 @@ def test_ask_uses_signed_in_users_llm_config(client):
     assert call["url"] == "https://api.deepseek.com/anthropic/v1/messages"
     assert call["headers"].get("x-api-key") == "user-secret-key"
     assert call["json"]["model"] == "user-model"
+
+
+def test_ask_stream_returns_sse_events(client):
+    async def fake_stream_agent(question, routing=None):
+        assert question == "how many?"
+        yield {"event": "status", "data": {"message": "Generating SQL…"}}
+        yield {"event": "delta", "data": {"text": "SELECT 1 AS n"}}
+        yield {
+            "event": "result",
+            "data": {
+                "sql": "SELECT 1 AS n",
+                "columns": ["n"],
+                "rows": [{"n": 1}],
+                "truncated": False,
+            },
+        }
+        yield {"event": "done", "data": {}}
+
+    with patch("gateway.agent.stream_agent", new=fake_stream_agent):
+        response = client.post(
+            "/api/agent/ask/stream",
+            headers=AUTH,
+            json={"question": "how many?"},
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: status" in response.text
+    assert 'data: {"text":"SELECT 1 AS n"}' in response.text
+    assert "event: result" in response.text
+    assert "event: done" in response.text
+
+
+def test_ask_stream_empty_question_is_400(client):
+    response = client.post(
+        "/api/agent/ask/stream", headers=AUTH, json={"question": "  "},
+    )
+    assert response.status_code == 400

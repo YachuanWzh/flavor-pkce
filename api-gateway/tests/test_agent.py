@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 import gateway.config as config
-from gateway.agent import ask_agent, _extract_sql_from_response
+from gateway.agent import ask_agent, stream_agent, _extract_sql_from_response
 from gateway.database import init_audit_db, insert_log
 
 
@@ -226,3 +226,23 @@ def test_ask_agent_user_routing_openai_profile():
     assert call["headers"].get("Authorization") == "Bearer user-openai-key"
     assert call["json"]["model"] == "user-gpt"
     assert result["columns"] == ["n"]
+
+
+def test_stream_agent_emits_deltas_sql_and_result(monkeypatch):
+    async def fake_stream(question, routing=None):
+        assert question == "how many?"
+        yield "SELECT COUNT(*) "
+        yield "AS n FROM audit_logs"
+
+    monkeypatch.setattr("gateway.agent._stream_upstream", fake_stream)
+
+    async def collect():
+        return [item async for item in stream_agent("how many?")]
+
+    events = asyncio.run(collect())
+    assert [item["event"] for item in events] == [
+        "status", "delta", "delta", "sql", "status", "result", "done",
+    ]
+    assert events[1]["data"]["text"] == "SELECT COUNT(*) "
+    assert events[3]["data"]["sql"] == "SELECT COUNT(*) AS n FROM audit_logs"
+    assert events[5]["data"]["rows"] == [{"n": 1}]

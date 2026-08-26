@@ -450,6 +450,52 @@ async def api_agent_ask(request: Request, body: AgentAskRequest):
         raise HTTPException(status_code=502, detail=f"Upstream LLM error: {exc}")
 
 
+@app.post("/api/agent/ask/stream")
+async def api_agent_ask_stream(request: Request, body: AgentAskRequest):
+    """Stream NL-to-SQL generation and the final read-only query result."""
+    if not body.question or not body.question.strip():
+        raise HTTPException(status_code=400, detail="Question is empty")
+
+    payload = _require_audit_token(request)
+    routing, err = await _resolve_user_routing(payload)
+    if err is not None:
+        return err
+
+    from gateway.agent import stream_agent
+
+    def encode(event: str, data: dict) -> str:
+        payload_json = _json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        return f"event: {event}\ndata: {payload_json}\n\n"
+
+    async def event_source():
+        try:
+            async for item in stream_agent(body.question, routing=routing):
+                yield encode(item["event"], item["data"])
+        except httpx.HTTPStatusError as exc:
+            status = getattr(exc.response, "status_code", None)
+            message = (
+                f"Upstream LLM returned HTTP {status}"
+                if status is not None
+                else "Upstream LLM request failed"
+            )
+            yield encode("error", {"message": message})
+        except httpx.HTTPError as exc:
+            yield encode("error", {"message": f"Upstream LLM error: {exc}"})
+        except ValueError as exc:
+            yield encode("error", {"message": str(exc)})
+        except Exception:
+            yield encode("error", {"message": "Agent stream failed"})
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Middleware: logging + metrics for every request
 # ---------------------------------------------------------------------------
