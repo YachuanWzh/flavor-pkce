@@ -243,6 +243,7 @@
         <tr>
           <th>Time (UTC)</th>
           <th>User</th>
+          <th>Client</th>
           <th>Session ID</th>
           <th>Method</th>
           <th>Path</th>
@@ -377,6 +378,7 @@ function render(data) {
     <tr>
       <td class="mono">${escapeHtml(row.timestamp)}</td>
       <td>${escapeHtml(row.user)}</td>
+      <td class="mono">${escapeHtml(row.client_id || '—')}</td>
       <td class="mono" style="max-width:180px;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(sid)}">${escapeHtml(sid)}</td>
       <td>${escapeHtml(row.method)}</td>
       <td class="mono">${escapeHtml(row.path)}</td>
@@ -482,6 +484,7 @@ function renderDetail(row) {
     ['ID', row.id],
     ['Time (UTC)', row.timestamp],
     ['User', row.user],
+    ['Client', row.client_id || '—'],
     ['Session ID', row.session_id || '—'],
     ['Method', row.method],
     ['Path', row.path],
@@ -499,7 +502,7 @@ function renderDetail(row) {
   ];
   grid.innerHTML = fields.map(([label, value]) => `
     <span class="detail-label">${escapeHtml(String(label))}</span>
-    <span class="detail-value${label === 'Session ID' || label === 'Path' || label === 'User ID' ? ' mono' : ''}">${escapeHtml(String(value))}</span>
+    <span class="detail-value${label === 'Client' || label === 'Session ID' || label === 'Path' || label === 'User ID' ? ' mono' : ''}">${escapeHtml(String(value))}</span>
   `).join('');
 
   // Append body sections after the grid

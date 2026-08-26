@@ -150,8 +150,9 @@ def test_tokens_schema():
     conn.close()
 
 
-def test_seed_data_creates_default_client():
+def test_seed_data_creates_default_client(monkeypatch):
     """Init should seed a default client and test user."""
+    monkeypatch.setattr(config, "SEED_TEST_USER", True)
     init_db()
     conn = sqlite3.connect(config.DB_PATH)
     cursor = conn.cursor()
@@ -163,6 +164,14 @@ def test_seed_data_creates_default_client():
     assert client[0] == "flavor-code-cli"
     assert client[1] == "flavor-code CLI"
     assert "http://127.0.0.1:" in client[2]
+
+    cursor.execute("SELECT id, name, redirect_uris FROM clients WHERE id = ?",
+                   ("flavor-lite-cli",))
+    lite_client = cursor.fetchone()
+    assert lite_client is not None
+    assert lite_client[0] == "flavor-lite-cli"
+    assert lite_client[1] == "flavor-lite CLI"
+    assert "http://127.0.0.1:" in lite_client[2]
 
     cursor.execute("SELECT id, username FROM users WHERE username = ?",
                    ("testuser",))

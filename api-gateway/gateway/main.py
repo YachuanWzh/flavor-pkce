@@ -460,6 +460,7 @@ def _audit_log_request(
         service_name=getattr(request.state, "service_name", None),
         session_id=getattr(request.state, "session_id", None),
         user_id=getattr(request.state, "user_id", None),
+        client_id=getattr(request.state, "client_id", None),
         request_body=getattr(request.state, "request_body", None),
         response_body=getattr(request.state, "response_body", None),
     )
@@ -524,6 +525,8 @@ async def proxy(request: Request, path: str):
     request.state.user_sub = payload.get("username") or payload.get("sub", "-")
     # Stable identifier for cross-system joins (auth-server users.id).
     request.state.user_id = payload.get("sub") or None
+    # OAuth client identity (for example flavor-code-cli/flavor-lite-cli).
+    request.state.client_id = payload.get("client_id") or None
 
     # Session identifier: prefer the JWT 'jti' (JWT ID) claim; fall back
     # to 'sid' (session ID) or generate one from sub + current time.

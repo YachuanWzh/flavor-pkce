@@ -27,7 +27,7 @@ def _row_hash(
     """SHA-256 of the previous hash plus this row's canonical content.
 
     The report columns added later (``cache_read_tokens``,
-    ``cache_creation_tokens``, ``service_name``, ``user_id``) are
+    ``cache_creation_tokens``, ``service_name``, ``user_id``, ``client_id``) are
     intentionally excluded: they are analytical fields, and hashing them
     would invalidate chains written before the columns existed.
     """
@@ -81,6 +81,7 @@ def init_audit_db() -> None:
             cache_creation_tokens INTEGER,
             service_name          TEXT,
             user_id               TEXT,
+            client_id             TEXT,
             request_body      TEXT,
             response_body     TEXT,
             prev_hash         TEXT,
@@ -100,6 +101,7 @@ def init_audit_db() -> None:
         ("cache_creation_tokens", "INTEGER"),
         ("service_name", "TEXT"),
         ("user_id", "TEXT"),
+        ("client_id", "TEXT"),
         ("request_body", "TEXT"),
         ("response_body", "TEXT"),
         ("prev_hash", "TEXT"),
@@ -115,6 +117,7 @@ def init_audit_db() -> None:
         ("idx_audit_model", "model"),
         ("idx_audit_session", "session_id"),
         ("idx_audit_user_id", "user_id"),
+        ("idx_audit_client_id", "client_id"),
     ):
         try:
             conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON audit_logs({idx_col})")
@@ -143,6 +146,7 @@ def insert_log(
     cache_creation_tokens: int | None = None,
     service_name: str | None = None,
     user_id: str | None = None,
+    client_id: str | None = None,
     request_body: str | None = None,
     response_body: str | None = None,
 ) -> None:
@@ -175,13 +179,13 @@ def insert_log(
            (timestamp, "user", method, path, status, duration_ms,
             upstream_ms, level, prompt_tokens, completion_tokens, model,
             session_id, cache_read_tokens, cache_creation_tokens,
-            service_name, user_id, request_body, response_body,
+            service_name, user_id, client_id, request_body, response_body,
             prev_hash, hash)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (timestamp, user, method, path, status, duration_ms,
          upstream_ms, level, prompt_tokens, completion_tokens, model,
          session_id, cache_read_tokens, cache_creation_tokens,
-         service_name, user_id, request_body, response_body,
+         service_name, user_id, client_id, request_body, response_body,
          prev_hash, row_hash),
     )
     conn.commit()
@@ -245,7 +249,7 @@ def query_logs(params: QueryParams) -> PageResult:
         ``page_size``   — entries per page (default 20, max 200).
         ``start_date``  — ISO date string (inclusive), e.g. ``"2026-07-01"``.
         ``end_date``    — ISO date string (inclusive), e.g. ``"2026-07-22"``.
-        ``keyword``     — case-insensitive substring match on ``user`` and ``path``.
+        ``keyword``     — case-insensitive substring match across common audit fields.
         ``user``        — exact match on ``user``.
     """
     page = max(1, params.get("page", 1))
@@ -266,11 +270,11 @@ def query_logs(params: QueryParams) -> PageResult:
         kw = params["keyword"]
         conditions.append(
             '("user" LIKE ? OR path LIKE ? OR model LIKE ?'
-            ' OR session_id LIKE ? OR request_body LIKE ?'
+            ' OR session_id LIKE ? OR client_id LIKE ? OR request_body LIKE ?'
             ' OR response_body LIKE ?)'
         )
         like = f"%{kw}%"
-        bindings.extend([like, like, like, like, like, like])
+        bindings.extend([like, like, like, like, like, like, like])
 
     if params.get("user"):
         conditions.append('"user" = ?')
@@ -284,7 +288,7 @@ def query_logs(params: QueryParams) -> PageResult:
         "id, timestamp, \"user\", method, path, status, duration_ms,"
         " upstream_ms, level, prompt_tokens, completion_tokens, model,"
         " session_id, cache_read_tokens, cache_creation_tokens,"
-        " service_name, user_id"
+        " service_name, user_id, client_id"
     )
 
     conn = _connect()

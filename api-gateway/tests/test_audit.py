@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import tempfile
 
 import pytest
@@ -144,6 +145,32 @@ class TestAuditDatabase:
         result = query_logs({"page": 1, "page_size": 1})
         item = result["items"][0]
         assert item["model"] is None
+
+    def test_client_id_column_persisted_and_searchable(self):
+        """OAuth client identity should be stored, returned, and searchable."""
+        insert_log(
+            timestamp="2026-07-22T12:00:00+00:00",
+            user="alice", method="POST", path="/v1/messages",
+            status=200, duration_ms=500.0, upstream_ms=450.0, level="INFO",
+            client_id="flavor-lite-cli",
+        )
+        item = query_logs({"keyword": "flavor-lite", "page": 1, "page_size": 1})["items"][0]
+        assert item["client_id"] == "flavor-lite-cli"
+
+    def test_existing_database_migrates_client_id_column(self):
+        """Existing audit databases should gain client_id without recreation."""
+        conn = sqlite3.connect(config.AUDIT_DB_PATH)
+        conn.execute("DROP INDEX IF EXISTS idx_audit_client_id")
+        conn.execute("ALTER TABLE audit_logs DROP COLUMN client_id")
+        conn.commit()
+        conn.close()
+
+        init_audit_db()
+
+        conn = sqlite3.connect(config.AUDIT_DB_PATH)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(audit_logs)")}
+        conn.close()
+        assert "client_id" in columns
 
     def test_keyword_searches_model(self):
         """Keyword filter should match on the model column."""
@@ -302,6 +329,8 @@ class TestAuditAPI:
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
         assert "Gateway Audit Logs" in resp.text
+        assert "<th>Client</th>" in resp.text
+        assert "row.client_id" in resp.text
 
     def test_logs_not_auto_logged(self, client):
         """Requests to /api/logs and /metrics should not be persisted to DB."""
@@ -346,6 +375,7 @@ class TestAuditAPI:
         assert "prompt_tokens" in item
         assert "completion_tokens" in item
         assert "model" in item
+        assert "client_id" in item
 
     def test_model_in_api_response_after_post(self, client):
         """A POST with a model field should be captured in the audit log."""
@@ -389,6 +419,8 @@ class TestAuditAPI:
             data = resp.json()
             models = {item.get("model") for item in data["items"]}
             assert "deepseek-v4-pro" in models
+            client_ids = {item.get("client_id") for item in data["items"]}
+            assert "test" in client_ids
         finally:
             gm._public_key = old_key
             config.JWT_PUBLIC_KEY_PATH = old_path

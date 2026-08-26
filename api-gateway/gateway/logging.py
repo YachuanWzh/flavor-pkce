@@ -43,6 +43,7 @@ def log_request(
     service_name: str | None = None,
     session_id: str | None = None,
     user_id: str | None = None,
+    client_id: str | None = None,
     request_body: str | None = None,
     response_body: str | None = None,
 ) -> None:
@@ -74,6 +75,8 @@ def log_request(
         entry["session_id"] = session_id
     if user_id is not None:
         entry["user_id"] = user_id
+    if client_id is not None:
+        entry["client_id"] = client_id
 
     getattr(_logger, level.lower())(json.dumps(entry, default=str))
 
@@ -94,6 +97,7 @@ def log_request(
         service_name=service_name,
         session_id=session_id,
         user_id=user_id,
+        client_id=client_id,
         request_body=request_body,
         response_body=response_body,
     )
