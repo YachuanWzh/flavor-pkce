@@ -25,6 +25,7 @@
 - **每用户 LLM 路由**:用户可自行配置上游服务地址与 API Key(Fernet 加密存储),管理员可统一管理模板;`config_version` 随 JWT 下发,网关按用户路由
 - **SSRF 出站防护**:用户配置的上游地址仅允许公网 http(s),私网/环回/元数据地址被拒;运维可通过白名单放行内网端点
 - **审计与观测**:全事件审计日志(SQLite,留存期自动清理)、审计 API Token 鉴权 + 哈希链完整性校验、用量统计、Prometheus metrics、SSE 审计流
+- **审计仪表盘与 data agent**:`/dashboard` ECharts 仪表盘(用量/错误/延迟/Top 模型/缓存命中率);`/api/query` 只读 SQL 查询(仅白名单表/视图、强制 LIMIT、单语句);`/api/agent/ask` NL→SQL 自然语言问数(LLM 走网关自身上游配置),配套 `/agent` 聊天界面
 - **安全加固**:强密码策略、登录限流与账号锁定、secure cookie / HSTS、会话持久化、生产环境对不安全默认密钥 **fail-fast**(拒绝启动)
 - **生产部署**:Docker Compose + Caddy 自动 HTTPS,服务端口只暴露在内部网络
 
@@ -125,7 +126,7 @@ docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod up -d --bu
 - **API Key 永不进客户端**:上游凭据只存在于网关/授权服务器环境变量与加密存储中
 - **PKCE 防授权码拦截**、`state` 防 CSRF、`redirect_uri` 精确匹配
 - **fail-fast**:`AUTH_SECRET_KEY` / `INTERNAL_SERVICE_TOKEN` 为默认值时拒绝启动(生产)
-- **审计链路**:`/api/logs*`、`/api/stats*` 无 Token 一律 401;管理员 JWT(SSO)可访问 `/gw/audit`、`/gw/report`
+- **审计链路**:`/api/logs*`、`/api/stats*`、`/api/query`、`/api/agent/ask` 无 Token 一律 401;管理员 JWT(SSO)可访问 `/gw/audit`、`/gw/report` 以及前端 `/dashboard`、`/agent`(经 `/gw/*` 前缀访问网关 API)
 - **SSRF**:出站请求校验目标地址,仅公网 http(s),私网/元数据被拒
 - **撤销**:网关每次请求校验 jti,刷新令牌轮换,登出即撤销
 
