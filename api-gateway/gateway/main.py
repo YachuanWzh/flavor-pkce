@@ -24,6 +24,7 @@ import jwt as pyjwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from prometheus_client import generate_latest, REGISTRY
+from pydantic import BaseModel
 
 import gateway.config
 from gateway.database import (
@@ -396,6 +397,26 @@ def api_stats_models(
     _require_audit_token(request)
     import gateway.stats as stats
     return {"items": stats.top_models(start_date, end_date, user, limit)}
+
+
+class QueryRequest(BaseModel):
+    sql: str
+
+
+@app.post("/api/query")
+def api_query(request: Request, body: QueryRequest):
+    """Execute a read-only SELECT against the audit database.
+
+    Gated by the same admin token as the audit API. Only whitelisted
+    tables/views and a single SELECT are allowed; rows are capped.
+    """
+    _require_audit_token(request)
+    try:
+        from gateway.query import execute_readonly_query
+        result = execute_readonly_query(body.sql)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return result
 
 
 # ---------------------------------------------------------------------------
