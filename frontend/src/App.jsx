@@ -4,6 +4,8 @@ import RegisterPage from "./RegisterPage";
 import ConsentPage from "./ConsentPage";
 import LlmSettingsPage from "./LlmSettingsPage";
 import AdminLlmSettingsPage from "./AdminLlmSettingsPage";
+import DashboardPage from "./DashboardPage";
+import AgentPage from "./AgentPage";
 import "./App.css";
 
 function Home() {
@@ -29,6 +31,8 @@ export default function App() {
         <Route path="/consent" element={<ConsentPage />} />
         <Route path="/settings/llm" element={<LlmSettingsPage />} />
         <Route path="/admin/llm-configs" element={<AdminLlmSettingsPage />} />
+        <Route path="/dashboard" element={<DashboardPage />} />
+        <Route path="/agent" element={<AgentPage />} />
       </Routes>
     </BrowserRouter>
   );
