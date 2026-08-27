@@ -12,9 +12,6 @@ from typing import TypedDict
 
 import gateway.config
 
-# Maximum characters stored per body field to prevent unbounded DB growth.
-_BODY_MAX_CHARS = 50_000
-
 
 def _row_hash(
     prev_hash: str,
@@ -41,12 +38,13 @@ def _row_hash(
 
 
 def _truncate_body(text: str | None) -> str | None:
-    """Truncate body text to _BODY_MAX_CHARS, appending a marker if clipped."""
-    if text is None:
-        return None
-    if len(text) <= _BODY_MAX_CHARS:
-        return text
-    return text[:_BODY_MAX_CHARS] + "\n…[truncated]"
+    """Truncate body text honouring config.AUDIT_BODY_MAX_CHARS.
+
+    Delegates to :func:`gateway.retention.truncate_body` so the limit is a
+    single configurable source of truth (import deferred to avoid a cycle).
+    """
+    from gateway.retention import truncate_body
+    return truncate_body(text)
 
 
 def _connect() -> sqlite3.Connection:
@@ -144,6 +142,29 @@ def init_audit_db() -> None:
             sort_order INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT    NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS quota_usage (
+            "user"            TEXT    NOT NULL,
+            day               TEXT    NOT NULL,
+            prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cost              REAL    NOT NULL DEFAULT 0.0,
+            minute_bucket     INTEGER NOT NULL DEFAULT 0,
+            minute_hits       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY ("user", day)
+        );
+
+        CREATE TABLE IF NOT EXISTS gateway_alerts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            day        TEXT    NOT NULL,
+            kind       TEXT    NOT NULL,
+            message    TEXT    NOT NULL,
+            metric     REAL,
+            baseline   REAL,
+            acked      INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT    NOT NULL,
+            UNIQUE (day, kind)
+        );
     """)
     # Migrate existing databases that lack newer columns.
     for col, col_type in (
@@ -239,9 +260,10 @@ def insert_log(
 ) -> None:
     """Insert a single audit-log row.
 
-    Body fields are truncated to ``_BODY_MAX_CHARS`` to prevent unbounded
-    storage growth from large LLM payloads. Each row is chained to the
-    previous row via ``prev_hash``/``hash`` (tamper-evident audit trail).
+    Body fields are truncated to ``config.AUDIT_BODY_MAX_CHARS`` (0 disables
+    storing bodies) to prevent unbounded storage growth from large LLM
+    payloads. Each row is chained to the previous row via ``prev_hash``/
+    ``hash`` (tamper-evident audit trail).
     """
     conn = _connect()
     conn.execute("BEGIN IMMEDIATE")
@@ -280,14 +302,22 @@ def insert_log(
 
 
 def verify_integrity() -> bool:
-    """Re-verify the whole hash chain. False means the log was tampered with."""
+    """Re-verify the whole hash chain. False means the log was tampered with.
+
+    The oldest surviving row anchors the chain with its own ``prev_hash``:
+    retention (``gateway.retention.purge_old_logs``) deletes old rows, and
+    the surviving head then points at a purged predecessor. Head tampering
+    is indistinguishable from a purge — an accepted trade-off of retention.
+    """
     conn = _connect()
     try:
-        prev = ""
+        prev = None  # None until the first surviving row sets the anchor
         rows = conn.execute("SELECT * FROM audit_logs ORDER BY id")
         for row in rows:
             row_prev = row["prev_hash"] or ""
-            if row_prev != prev:
+            if prev is None:
+                prev = row_prev  # chain head anchor
+            elif row_prev != prev:
                 return False
             expected = _row_hash(
                 prev,
@@ -461,6 +491,16 @@ def insert_agent_query(
     conn.close()
 
 
+def get_agent_query_by_id(query_id: int) -> dict | None:
+    """Return one agent-query record by primary key (for corrections)."""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT * FROM agent_queries WHERE id = ?", (query_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def query_agent_queries(
     params: QueryParams,
 ) -> PageResult:
@@ -523,6 +563,7 @@ def agent_query_stats(params: QueryParams) -> dict:
                        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
                        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error,
                        SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked,
+                       SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
                        ROUND(AVG(CASE WHEN duration_ms > 0 THEN duration_ms END), 2) AS avg_duration_ms,
                        COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
                        COALESCE(SUM(completion_tokens), 0) AS completion_tokens
@@ -534,7 +575,8 @@ def agent_query_stats(params: QueryParams) -> dict:
                        COUNT(*) AS total,
                        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
                        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error,
-                       SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked
+                       SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked,
+                       SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected
                 FROM agent_queries {where}
                 GROUP BY date ORDER BY date""",
             bindings,
@@ -561,6 +603,7 @@ def agent_query_stats(params: QueryParams) -> dict:
         "success": row["success"] or 0,
         "error": row["error"] or 0,
         "blocked": row["blocked"] or 0,
+        "rejected": row["rejected"] or 0,
         "success_rate": round((row["success"] or 0) / total, 4) if total else 0.0,
         "avg_duration_ms": row["avg_duration_ms"],
         "prompt_tokens": row["prompt_tokens"],

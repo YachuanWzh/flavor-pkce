@@ -857,6 +857,33 @@ body::after {
 .badge-success { background: rgba(52, 211, 153, 0.15); color: #34d399; }
 .badge-error { background: rgba(248, 113, 113, 0.15); color: #f87171; }
 .badge-blocked { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+.badge-rejected { background: rgba(167, 139, 250, 0.15); color: #a78bfa; }
+
+/* Small inline action button (review-page correction, alert ack) */
+.btn-mini {
+  background: rgba(91, 141, 239, 0.12); color: var(--color-accent, #5b8def);
+  border: 1px solid rgba(91, 141, 239, 0.35); border-radius: 8px;
+  padding: 2px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.btn-mini:hover:not(:disabled) { background: rgba(91, 141, 239, 0.25); }
+.btn-mini:disabled { opacity: 0.5; cursor: default; }
+
+/* Anomaly alert banner on the dashboard */
+.alert-banner {
+  background: rgba(248, 113, 113, 0.08); border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: 12px; padding: 12px 16px; margin-bottom: 18px; font-size: 13.5px;
+}
+.alert-banner-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.alert-dot { width: 9px; height: 9px; border-radius: 50%; background: #f87171; flex: none; }
+.alert-banner ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.alert-banner li { display: flex; align-items: center; gap: 10px; }
+.alert-day { color: var(--color-text-muted); font-variant-numeric: tabular-nums; flex: none; }
+.alert-kind {
+  background: rgba(248, 113, 113, 0.15); color: #f87171; border-radius: 999px;
+  padding: 1px 8px; font-size: 11px; font-weight: 700; flex: none;
+}
+.alert-msg { flex: 1; }
+.alert-banner li .btn-mini { margin-left: auto; flex: none; }
 .muted { color: var(--color-text-muted); }
 
 /* full-page variant (/agent) */

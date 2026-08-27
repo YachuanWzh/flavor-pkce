@@ -53,6 +53,29 @@ REVOCATION_CACHE_TTL_SECONDS = int(os.environ.get("REVOCATION_CACHE_TTL_SECONDS"
 # this many seconds (circuit-breaker cooldown). 0 disables cooldowns.
 FAILOVER_COOLDOWN_SECONDS = int(os.environ.get("FAILOVER_COOLDOWN_SECONDS", "30"))
 
+# Per-user quota enforcement on the proxy (0 = limit disabled).
+# Requests per user per fixed one-minute window.
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "0"))
+# prompt+completion tokens per user per UTC day.
+DAILY_TOKEN_BUDGET = int(os.environ.get("DAILY_TOKEN_BUDGET", "0"))
+# Estimated USD spend per user per UTC day (priced via MODEL_PRICES_JSON).
+DAILY_COST_BUDGET_USD = float(os.environ.get("DAILY_COST_BUDGET_USD", "0"))
+
+# Audit data governance (mirrors auth-server's AUDIT_RETENTION_DAYS).
+# Days to keep gateway audit rows (audit_logs/agent_queries/quota_usage);
+# 0 disables the startup purge.
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "180"))
+# Max characters stored per request/response body column in audit_logs;
+# 0 disables storing bodies entirely.
+AUDIT_BODY_MAX_CHARS = int(os.environ.get("AUDIT_BODY_MAX_CHARS", "50000"))
+
+# Anomaly scan cadence (seconds) after the initial startup scan.
+# 0 disables the periodic rescanner (startup scan and manual /api/alerts/scan
+# still work).
+ALERT_SCAN_INTERVAL_SECONDS = int(
+    os.environ.get("ALERT_SCAN_INTERVAL_SECONDS", "86400")
+)
+
 # Bearer token required for the audit-log API (P0-1). When empty, all
 # /api/logs* endpoints refuse access (fail-closed for audit data).
 AUDIT_API_TOKEN = os.environ.get("AUDIT_API_TOKEN", "")

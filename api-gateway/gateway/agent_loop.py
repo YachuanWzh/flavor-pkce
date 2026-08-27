@@ -495,10 +495,19 @@ async def _confirm_agent_turn_impl(
         return
 
     if not approved:
+        rejected_sql = session.pending_sql
+        rejected_question = session.pending_question or ""
         session.pending_sql = None
         session.pending_question = None
         session.pending_attempt = 0
         session.pending_chart = None
+        # Correction loop input: keep the rejected SQL so the review page
+        # can promote it (or an admin-edited variant) to a Q&A knowledge pair.
+        _record_audit(
+            user=getattr(session, "user", None) or user,
+            user_id=getattr(session, "user_id", None) or user_id,
+            question=rejected_question, sql=rejected_sql, status="rejected",
+        )
         yield {"event": "rejected", "data": {}}
         yield {"event": "done", "data": {}}
         return

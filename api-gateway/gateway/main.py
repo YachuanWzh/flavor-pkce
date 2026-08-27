@@ -27,6 +27,7 @@ from prometheus_client import generate_latest, REGISTRY
 from pydantic import BaseModel
 
 import gateway.config
+import gateway.quota
 from gateway.database import (
     init_audit_db, query_logs, query_log_by_id, clear_logs, verify_integrity,
 )
@@ -45,7 +46,36 @@ from gateway.metrics import (
 setup_logging()
 init_audit_db()
 
-app = FastAPI(title="PKCE API Gateway")
+from contextlib import asynccontextmanager  # noqa: E402
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Startup governance: retention purge + anomaly scan + periodic rescans."""
+    import asyncio
+
+    from gateway.retention import purge_old_logs
+    from gateway.anomaly import scan_daily
+    purge_old_logs()      # audit retention policy (like auth-server P0-10)
+    scan_daily()          # evaluate the completed day so the dashboard is fresh
+
+    async def _rescan_loop():
+        while True:
+            await asyncio.sleep(gateway.config.ALERT_SCAN_INTERVAL_SECONDS)
+            try:
+                await asyncio.to_thread(scan_daily)
+            except Exception:
+                pass  # scheduling must never take the gateway down
+
+    scanner: asyncio.Task | None = None
+    if gateway.config.ALERT_SCAN_INTERVAL_SECONDS > 0:
+        scanner = asyncio.create_task(_rescan_loop())
+    yield
+    if scanner is not None:
+        scanner.cancel()
+
+
+app = FastAPI(title="PKCE API Gateway", lifespan=_lifespan)
 
 _public_key = None
 _routing_cache: dict[tuple[str, int], tuple[float, dict]] = {}
@@ -95,6 +125,7 @@ async def _is_jti_revoked(jti: str) -> bool:
 # Path prefixes that the observability middleware should NOT audit-log.
 _AUDIT_SKIP_PREFIXES = (
     "/metrics", "/api/logs", "/api/stats", "/api/query", "/api/agent",
+    "/api/alerts",
     "/health", "/report",
 )
 
@@ -648,6 +679,57 @@ def api_agent_presets_delete(request: Request, preset_id: int):
     return {"deleted": True}
 
 
+class AgentCorrectionRequest(BaseModel):
+    """Correct a recorded agent query into a Q&A knowledge pair.
+
+    ``sql_template`` empty/omitted promotes the SQL that was recorded with
+    the query (e.g. the corrected variant the admin eventually approved).
+    """
+    sql_template: str = ""
+    tags: list[str] = []
+
+
+@app.post("/api/agent/queries/{query_id}/correction")
+def api_agent_query_correction(request: Request, query_id: int, body: AgentCorrectionRequest):
+    """One-click correction loop: turn a rejected/edited agent query into an
+    enabled Q&A few-shot pair so the same question class generates correctly.
+
+    Upsert semantics (unique on question): re-correcting the same question
+    updates the stored SQL. The review page calls this after a rejection or
+    an admin-corrected execution.
+    """
+    _require_audit_token(request)
+    from gateway.database import get_agent_query_by_id
+    from gateway.qa import upsert_qa_pair
+
+    record = get_agent_query_by_id(query_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Agent query not found")
+
+    sql = (body.sql_template or "").strip()
+    if not sql:
+        # A rejected record's stored SQL is known-wrong — promoting it would
+        # poison the knowledge base. Rejections require an explicit fix.
+        if record["status"] == "rejected":
+            raise HTTPException(
+                status_code=400,
+                detail="Query was rejected; provide corrected sql_template",
+            )
+        sql = (record.get("sql") or "").strip()
+    if not sql:
+        raise HTTPException(
+            status_code=400,
+            detail="No SQL to learn from: provide sql_template",
+        )
+    tags = list(dict.fromkeys([*(body.tags or []), "correction"]))
+    try:
+        return upsert_qa_pair(
+            record["question"], sql, tags, enabled=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.get("/api/agent/stats")
 def api_agent_stats(
     request: Request,
@@ -663,6 +745,40 @@ def api_agent_stats(
         "end_date": end_date,
         "user": user,
     })
+
+
+# ---------------------------------------------------------------------------
+# Anomaly alerts (daily scan → gateway_alerts table)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/alerts")
+def api_alerts_list(request: Request, include_acked: bool = False):
+    """List anomaly alerts (audit-token gated). Open alerts only by default."""
+    _require_audit_token(request)
+    from gateway.anomaly import list_alerts
+    return {"items": list_alerts(include_acked=include_acked)}
+
+
+@app.post("/api/alerts/scan")
+def api_alerts_scan(request: Request):
+    """Run the daily anomaly scan now (audit-token gated).
+
+    Normally triggered by the scheduler on startup / periodically; this
+    endpoint gives the dashboard a manual refresh.
+    """
+    _require_audit_token(request)
+    from gateway.anomaly import scan_daily
+    return {"alerts": scan_daily()}
+
+
+@app.post("/api/alerts/{alert_id}/ack")
+def api_alerts_ack(request: Request, alert_id: int):
+    """Acknowledge one alert (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.anomaly import ack_alert
+    if not ack_alert(alert_id):
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"acked": True}
 
 
 @app.post("/api/agent/ask")
@@ -907,6 +1023,41 @@ async def log_metrics_middleware(request: Request, call_next):
             _audit_log_request(request, status_code, duration)
 
 
+def _quota_response_headers(user: str) -> dict:
+    """Advertise the daily token budget/usage so clients can back off early.
+
+    Only emitted when a token budget is configured (0 = unlimited).
+    """
+    budget = gateway.config.DAILY_TOKEN_BUDGET
+    if budget <= 0:
+        return {}
+    usage = gateway.quota.get_day_usage(user)
+    return {
+        "X-Gateway-Daily-Token-Budget": str(budget),
+        "X-Gateway-Daily-Tokens-Used": str(
+            usage["prompt_tokens"] + usage["completion_tokens"]
+        ),
+    }
+
+
+def _record_quota_usage(request: Request) -> None:
+    """Accumulate one proxied request's token usage into the daily budget.
+
+    Called from the audit-log writer (both the normal middleware path and
+    the deferred SSE finalisation), so usage is counted exactly once and
+    only when the upstream actually reported it.
+    """
+    user = getattr(request.state, "quota_user", None)
+    if not user:
+        return
+    gateway.quota.record_usage(
+        user,
+        prompt_tokens=getattr(request.state, "prompt_tokens", None),
+        completion_tokens=getattr(request.state, "completion_tokens", None),
+        model=getattr(request.state, "model", None),
+    )
+
+
 def _audit_log_request(
     request: Request, status_code: int, duration: float,
 ) -> None:
@@ -1004,6 +1155,14 @@ async def proxy(request: Request, path: str):
         or payload.get("sid")
         or f"{payload.get('sub', 'unknown')}-{int(time.time())}"
     )
+
+    # --- Per-user quota / budget enforcement (429 on exhaustion) ---
+    quota_user = str(payload.get("username") or payload.get("sub") or "-")
+    request.state.quota_user = quota_user
+    allowed, quota_error = gateway.quota.check(quota_user)
+    if not allowed:
+        return JSONResponse(status_code=429, content=quota_error)
+    quota_headers = _quota_response_headers(quota_user)
 
     routing, routing_error = await _resolve_user_routing(payload)
     if routing_error is not None:
@@ -1192,6 +1351,7 @@ async def proxy(request: Request, path: str):
                         # message_delta / OpenAI final usage chunk); recover
                         # them from the full buffered body now.
                         _extract_usage_from_stream(request, combined)
+                        _record_quota_usage(request)
                         request.state.upstream_ms = (
                             (time.perf_counter() - upstream_start) * 1000
                         )
@@ -1225,6 +1385,10 @@ async def proxy(request: Request, path: str):
                 (time.perf_counter() - upstream_start) * 1000
             )
             _extract_full_token_usage(request, content)
+            # Usage is final now — count it toward the daily budget and
+            # report the post-request balance to the client.
+            _record_quota_usage(request)
+            resp_headers.update(_quota_response_headers(quota_user))
 
             return Response(
                 content=content,

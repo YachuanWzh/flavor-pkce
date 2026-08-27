@@ -112,6 +112,35 @@ def test_verify_integrity_empty_chain_is_valid():
     assert verify_integrity() is True
 
 
+def test_verify_integrity_tolerates_purged_chain_head():
+    """Retention deletes the oldest rows; the surviving head's prev_hash then
+    points at a purged predecessor. The chain must still verify from the
+    first surviving row forward (head-truncation is not distinguishable
+    from a purge — documented trade-off of retention)."""
+    _sample_log("alice")
+    _sample_log("bob")
+    _sample_log("carol")
+    import sqlite3
+    conn = sqlite3.connect(config.AUDIT_DB_PATH)
+    conn.execute("DELETE FROM audit_logs WHERE id = 1")  # simulate purge
+    conn.commit()
+    conn.close()
+    assert verify_integrity() is True
+
+
+def test_verify_integrity_detects_tampering_after_head_purge():
+    _sample_log("alice")
+    _sample_log("bob")
+    _sample_log("carol")
+    import sqlite3
+    conn = sqlite3.connect(config.AUDIT_DB_PATH)
+    conn.execute("DELETE FROM audit_logs WHERE id = 1")
+    conn.execute("UPDATE audit_logs SET status = 599 WHERE id = 2")
+    conn.commit()
+    conn.close()
+    assert verify_integrity() is False
+
+
 def test_insert_log_hashes_are_chained():
     _sample_log("alice")
     _sample_log("bob")

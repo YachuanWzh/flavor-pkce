@@ -14,6 +14,17 @@ async function fetchStats(path) {
   return (await resp.json()).items;
 }
 
+async function fetchOpenAlerts() {
+  // Anomaly alerts are advisory — a failed fetch must not break the dashboard.
+  try {
+    const resp = await fetch("/gw/api/alerts", { credentials: "include" });
+    if (!resp.ok) return [];
+    return (await resp.json()).items;
+  } catch {
+    return [];
+  }
+}
+
 function useChart(ref, option) {
   useEffect(() => {
     if (!ref.current || !option) return undefined;
@@ -61,6 +72,22 @@ export default function DashboardPage() {
   const [error, setError] = useState("");
   const [data, setData] = useState(null);
   const [chatOpen, setChatOpen] = useState(false);
+  const [alerts, setAlerts] = useState([]);
+
+  const loadAlerts = useCallback(async () => {
+    setAlerts(await fetchOpenAlerts());
+  }, []);
+
+  const ackAlert = useCallback(async (id) => {
+    try {
+      const resp = await fetch(`/gw/api/alerts/${id}/ack`, {
+        method: "POST", credentials: "include",
+      });
+      if (resp.ok) setAlerts((prev) => prev.filter((a) => a.id !== id));
+    } catch {
+      // Banner stays; the next refresh retries.
+    }
+  }, []);
 
   const tokensRef = useRef(null);
   const requestsRef = useRef(null);
@@ -99,6 +126,7 @@ export default function DashboardPage() {
   }, [startDate, endDate]);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { loadAlerts(); }, [loadAlerts]);
 
   const tokenOption = data && {
     ...seriesBase(),
@@ -203,6 +231,27 @@ export default function DashboardPage() {
       </header>
 
       {error && <div className="error-msg">{error}</div>}
+
+      {alerts.length > 0 && (
+        <section className="alert-banner" aria-label="Anomaly alerts">
+          <div className="alert-banner-head">
+            <span className="alert-dot" />
+            <strong>{alerts.length} anomaly alert{alerts.length > 1 ? "s" : ""}</strong>
+            <span className="muted">— daily scan vs trailing 7-day baseline</span>
+          </div>
+          <ul>
+            {alerts.map((a) => (
+              <li key={a.id}>
+                <span className="alert-day">{a.day}</span>
+                <span className={`alert-kind kind-${a.kind}`}>{a.kind}</span>
+                <span className="alert-msg">{a.message}</span>
+                <button className="btn-mini" onClick={() => ackAlert(a.id)}>确认</button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {loading && <div className="loading">Loading dashboard…</div>}
 
       {data && !loading && (
