@@ -481,6 +481,45 @@ def api_agent_queries(
     })
 
 
+class MetricTermRequest(BaseModel):
+    term: str
+    definition: str
+    synonyms: list[str] = []
+    enabled: bool = True
+
+
+@app.get("/api/agent/metrics")
+def api_agent_metrics_list(request: Request):
+    """List admin metric terms (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.terms import list_metric_terms
+    return {"items": list_metric_terms()}
+
+
+@app.post("/api/agent/metrics")
+def api_agent_metrics_upsert(request: Request, body: MetricTermRequest):
+    """Create or update one metric term (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.terms import upsert_metric_term
+    try:
+        return upsert_metric_term(
+            body.term, body.definition, body.synonyms, enabled=body.enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/agent/metrics/{term_id}")
+def api_agent_metrics_delete(request: Request, term_id: int):
+    """Delete one metric term (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.terms import delete_metric_term
+    deleted = delete_metric_term(term_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Metric term not found")
+    return {"deleted": True}
+
+
 @app.post("/api/agent/ask")
 async def api_agent_ask(request: Request, body: AgentAskRequest):
     """Translate a natural-language question to SQL and run it read-only.
