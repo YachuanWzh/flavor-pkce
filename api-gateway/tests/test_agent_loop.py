@@ -197,6 +197,24 @@ def test_chart_cleared_on_rejection(store):
     assert session.pending_chart is None
 
 
+# ---- metric-term prompt injection ------------------------------------------
+
+
+def test_system_prompt_includes_metric_terms(monkeypatch):
+    from gateway import terms
+    from gateway.agent_loop import _build_system_prompt as loop_prompt
+
+    def fake_terms(*_a, **_k):
+        return [
+            {"term": "cache_hit_ratio", "definition": "cache_read / total", "synonyms": "[\"命中率\"]", "enabled": True}
+        ]
+
+    monkeypatch.setattr(terms, "list_metric_terms", fake_terms)
+    text = loop_prompt()
+    assert "cache_hit_ratio" in text
+    assert "命中率" in text
+
+
 # ---- reflection retries ----------------------------------------------------
 
 

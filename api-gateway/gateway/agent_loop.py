@@ -37,6 +37,7 @@ from gateway.compression import (
 from gateway.intent import parse_intent
 from gateway.query import SCHEMA_DESCRIPTIONS, execute_readonly_query
 from gateway.sqlguard import check_sql_safety
+from gateway.terms import render_metric_prompt
 
 MAX_REFLECT_RETRIES = 3
 _ANTHROPIC_SUFFIX = "/anthropic"
@@ -68,7 +69,11 @@ Rules:
 
 def _build_system_prompt() -> str:
     today = datetime.now(timezone.utc).date().isoformat()
-    return _SYSTEM_PROMPT.format(today=today, **SCHEMA_DESCRIPTIONS)
+    base = _SYSTEM_PROMPT.format(today=today, **SCHEMA_DESCRIPTIONS)
+    metric_prompt = render_metric_prompt()
+    if metric_prompt:
+        base += "\n\n" + metric_prompt
+    return base
 
 
 def _default_execute(sql: str) -> dict:

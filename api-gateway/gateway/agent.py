@@ -23,6 +23,7 @@ import httpx
 import gateway.config
 from gateway.database import insert_agent_query
 from gateway.query import execute_readonly_query, SCHEMA_DESCRIPTIONS
+from gateway.terms import render_metric_prompt
 
 # Correction rounds after the first generation when the generated SQL fails
 # to execute (P1-3). Total upstream calls per question = 1 + MAX_SQL_RETRIES.
@@ -66,7 +67,11 @@ def _extract_sql_from_response(text: str | None) -> str | None:
 def _build_system_prompt() -> str:
     """Render the system prompt with today's UTC date (P0-2)."""
     today = datetime.now(timezone.utc).date().isoformat()
-    return _SYSTEM_PROMPT.format(today=today, **SCHEMA_DESCRIPTIONS)
+    base = _SYSTEM_PROMPT.format(today=today, **SCHEMA_DESCRIPTIONS)
+    metric_prompt = render_metric_prompt()
+    if metric_prompt:
+        base += "\n\n" + metric_prompt
+    return base
 
 
 def _extract_usage(data: dict) -> dict:
