@@ -16,6 +16,8 @@ import re
 
 VALID_INTENTS = frozenset({"query_data", "chitchat", "clarify"})
 
+CHART_TYPES = frozenset({"bar", "line", "pie"})
+
 _FENCED_JSON = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
 
 
@@ -64,6 +66,20 @@ def _candidate_objects(text: str):
         i = end + 1
 
 
+def _validate_chart(value) -> dict | None:
+    """Accept only dicts with a supported type and string x/series slots."""
+    if not isinstance(value, dict):
+        return None
+    ctype = value.get("type")
+    if ctype not in CHART_TYPES:
+        return None
+    x = value.get("x")
+    series = value.get("series")
+    if not isinstance(x, str) or not isinstance(series, str) or not x or not series:
+        return None
+    return {"type": ctype, "x": x, "series": series}
+
+
 def _validate(obj) -> dict | None:
     """Accept only dicts with a valid intent and well-typed optional slots."""
     if not isinstance(obj, dict):
@@ -82,6 +98,11 @@ def _validate(obj) -> dict | None:
         if not isinstance(message, str):
             return None
         result["message"] = message
+    chart = obj.get("chart")
+    if intent == "query_data" and chart is not None:
+        validated_chart = _validate_chart(chart)
+        if validated_chart is not None:
+            result["chart"] = validated_chart
     return result
 
 

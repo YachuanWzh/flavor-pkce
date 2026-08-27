@@ -56,3 +56,27 @@ def test_valid_intents_accepted():
 
 def test_sql_must_be_string():
     assert parse_intent('{"intent": "query_data", "sql": 123}') is None
+
+
+def test_chart_slot_parsed_for_query_data():
+    result = parse_intent(
+        '{"intent": "query_data", "sql": "SELECT 1", '
+        '"chart": {"type": "bar", "x": "date", "series": "requests"}}'
+    )
+    assert result["chart"] == {"type": "bar", "x": "date", "series": "requests"}
+
+
+def test_chart_slot_requires_query_data():
+    # chart on a non-query_data intent is dropped (not fatal).
+    result = parse_intent(
+        '{"intent": "chitchat", "message": "hi", "chart": {"type": "bar"}}'
+    )
+    assert "chart" not in result
+
+
+def test_chart_slot_rejects_invalid_type():
+    result = parse_intent(
+        '{"intent": "query_data", "sql": "SELECT 1", '
+        '"chart": {"type": "scatter", "x": "date", "series": "n"}}'
+    )
+    assert "chart" not in result
