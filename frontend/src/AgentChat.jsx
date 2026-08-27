@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import * as echarts from "echarts";
 
 /* Shared data-agent chat: session loop, real SSE streaming, human SQL
  * confirmation. Used full-page by /agent and as a floating panel on
@@ -69,6 +70,48 @@ function ResultTable({ result }) {
       )}
     </div>
   );
+}
+
+function ResultChart({ chart, result }) {
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!ref.current || !chart || !result?.rows?.length) return undefined;
+    const ctype = chart.type;
+    const x = chart.x;
+    const series = chart.series;
+    if (!result.columns.includes(x) || !result.columns.includes(series)) {
+      return undefined;
+    }
+    const categories = result.rows.map((r) => String(r[x] ?? ""));
+    const values = result.rows.map((r) => Number(r[series] ?? 0));
+    const option = ctype === "pie"
+      ? {
+          tooltip: { trigger: "item" },
+          series: [{
+            type: "pie",
+            radius: ["35%", "70%"],
+            data: result.rows.map((r) => ({ name: String(r[x] ?? ""), value: Number(r[series] ?? 0) })),
+          }],
+        }
+      : {
+          tooltip: { trigger: "axis" },
+          grid: { left: 48, right: 16, top: 24, bottom: 32 },
+          xAxis: { type: "category", data: categories },
+          yAxis: { type: "value" },
+          series: [{ name: series, type: ctype === "bar" ? "bar" : "line", data: values, smooth: true }],
+        };
+    const chartInstance = echarts.init(ref.current);
+    chartInstance.setOption(option);
+    const onResize = () => chartInstance.resize();
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      chartInstance.dispose();
+    };
+  }, [chart, result]);
+
+  return <div ref={ref} className="chat-chart" style={{ height: 280 }} />;
 }
 
 export default function AgentChat({ variant = "panel", onClose }) {
@@ -240,6 +283,7 @@ export default function AgentChat({ variant = "panel", onClose }) {
                 <>
                   <pre className="chat-sql">{msg.result.sql}</pre>
                   <ResultTable result={msg.result} />
+                  {msg.result.chart && <ResultChart chart={msg.result.chart} result={msg.result} />}
                 </>
               )}
             </div>
