@@ -115,6 +115,35 @@ def init_audit_db() -> None:
             enabled    INTEGER NOT NULL DEFAULT 1,
             updated_at TEXT    NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS agent_qa_pairs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            question     TEXT    NOT NULL UNIQUE,
+            sql_template TEXT    NOT NULL,
+            tags         TEXT    NOT NULL DEFAULT '[]',
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            updated_at   TEXT    NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS column_glossary (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name    TEXT    NOT NULL,
+            column_name   TEXT    NOT NULL,
+            business_name TEXT    NOT NULL DEFAULT '',
+            synonyms      TEXT    NOT NULL DEFAULT '[]',
+            description   TEXT    NOT NULL DEFAULT '',
+            enabled       INTEGER NOT NULL DEFAULT 1,
+            updated_at    TEXT    NOT NULL,
+            UNIQUE (table_name, column_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS preset_questions (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            question   TEXT    NOT NULL UNIQUE,
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT    NOT NULL
+        );
     """)
     # Migrate existing databases that lack newer columns.
     for col, col_type in (

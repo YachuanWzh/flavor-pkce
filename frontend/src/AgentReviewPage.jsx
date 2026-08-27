@@ -109,6 +109,7 @@ export default function AgentReviewPage() {
           <h1>Agent usage review</h1>
           <p>How often the data agent succeeds, what it fails on, and how much it costs in tokens.</p>
         </div>
+        <a className="agent-nav-link" href="/agent/knowledge">Knowledge →</a>
       </header>
 
       {error && <div className="form-error">{error}</div>}

@@ -22,7 +22,9 @@ import httpx
 
 import gateway.config
 from gateway.database import insert_agent_query
+from gateway.glossary import render_glossary_prompt
 from gateway.query import execute_readonly_query, SCHEMA_DESCRIPTIONS
+from gateway.qa import render_qa_prompt
 from gateway.terms import render_metric_prompt
 
 # Correction rounds after the first generation when the generated SQL fails
@@ -64,13 +66,24 @@ def _extract_sql_from_response(text: str | None) -> str | None:
     return None
 
 
-def _build_system_prompt() -> str:
-    """Render the system prompt with today's UTC date (P0-2)."""
+def _build_system_prompt(question: str | None = None) -> str:
+    """Render the system prompt with today's UTC date (P0-2).
+
+    ``question`` enables context-sensitive few-shot injection: enabled QA
+    pairs whose question overlaps the current user question are appended,
+    and every enabled column-glossary annotation is included.
+    """
     today = datetime.now(timezone.utc).date().isoformat()
     base = _SYSTEM_PROMPT.format(today=today, **SCHEMA_DESCRIPTIONS)
     metric_prompt = render_metric_prompt()
     if metric_prompt:
         base += "\n\n" + metric_prompt
+    glossary_prompt = render_glossary_prompt()
+    if glossary_prompt:
+        base += "\n\n" + glossary_prompt
+    qa_prompt = render_qa_prompt(question)
+    if qa_prompt:
+        base += "\n\n" + qa_prompt
     return base
 
 
@@ -227,7 +240,7 @@ async def _call_upstream(
         payload = {
             "model": model,
             "max_tokens": 1024,
-            "system": _build_system_prompt(),
+            "system": _build_system_prompt(question),
             "messages": [{"role": "user", "content": user_message}],
         }
         _apply_upstream_auth(headers, api_key, auth_type)
@@ -250,7 +263,7 @@ async def _call_upstream(
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": _build_system_prompt()},
+            {"role": "system", "content": _build_system_prompt(question)},
             {"role": "user", "content": user_message},
         ],
         "temperature": 0,
@@ -312,7 +325,7 @@ async def _stream_upstream(
         payload = {
             "model": cfg["default_model"],
             "max_tokens": 1024,
-            "system": _build_system_prompt(),
+            "system": _build_system_prompt(question),
             "messages": [{"role": "user", "content": user_message}],
             "stream": True,
         }
@@ -321,7 +334,7 @@ async def _stream_upstream(
         payload = {
             "model": cfg["default_model"],
             "messages": [
-                {"role": "system", "content": _build_system_prompt()},
+                {"role": "system", "content": _build_system_prompt(question)},
                 {"role": "user", "content": user_message},
             ],
             "temperature": 0,

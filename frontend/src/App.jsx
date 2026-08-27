@@ -7,6 +7,7 @@ import AdminLlmSettingsPage from "./AdminLlmSettingsPage";
 import DashboardPage from "./DashboardPage";
 import AgentPage from "./AgentPage";
 import AgentReviewPage from "./AgentReviewPage";
+import AgentKnowledgePage from "./AgentKnowledgePage";
 import "./App.css";
 
 function Home() {
@@ -35,6 +36,7 @@ export default function App() {
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/agent" element={<AgentPage />} />
         <Route path="/agent/review" element={<AgentReviewPage />} />
+        <Route path="/agent/knowledge" element={<AgentKnowledgePage />} />
       </Routes>
     </BrowserRouter>
   );

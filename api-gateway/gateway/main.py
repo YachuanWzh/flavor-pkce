@@ -520,6 +520,134 @@ def api_agent_metrics_delete(request: Request, term_id: int):
     return {"deleted": True}
 
 
+# ---------------------------------------------------------------------------
+# Data-agent knowledge: QA pairs / column glossary / preset questions
+# ---------------------------------------------------------------------------
+
+
+class QaPairRequest(BaseModel):
+    question: str
+    sql_template: str
+    tags: list[str] = []
+    enabled: bool = True
+
+
+class GlossaryEntryRequest(BaseModel):
+    table_name: str
+    column_name: str
+    business_name: str = ""
+    synonyms: list[str] = []
+    description: str = ""
+    enabled: bool = True
+
+
+class PresetQuestionRequest(BaseModel):
+    question: str
+    enabled: bool = True
+    sort_order: int = 0
+
+
+@app.get("/api/agent/qa")
+def api_agent_qa_list(request: Request):
+    """List QA knowledge pairs (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.qa import list_qa_pairs
+    return {"items": list_qa_pairs()}
+
+
+@app.post("/api/agent/qa")
+def api_agent_qa_upsert(request: Request, body: QaPairRequest):
+    """Create or update one QA pair (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.qa import upsert_qa_pair
+    try:
+        return upsert_qa_pair(
+            body.question, body.sql_template, body.tags, enabled=body.enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/agent/qa/{pair_id}")
+def api_agent_qa_delete(request: Request, pair_id: int):
+    """Delete one QA pair (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.qa import delete_qa_pair
+    deleted = delete_qa_pair(pair_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="QA pair not found")
+    return {"deleted": True}
+
+
+@app.get("/api/agent/glossary")
+def api_agent_glossary_list(request: Request):
+    """List column-glossary entries (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.glossary import list_glossary_entries
+    return {"items": list_glossary_entries()}
+
+
+@app.post("/api/agent/glossary")
+def api_agent_glossary_upsert(request: Request, body: GlossaryEntryRequest):
+    """Create or update one column-glossary entry (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.glossary import upsert_glossary_entry
+    try:
+        return upsert_glossary_entry(
+            body.table_name, body.column_name, body.business_name,
+            body.synonyms, body.description, enabled=body.enabled,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/agent/glossary/{entry_id}")
+def api_agent_glossary_delete(request: Request, entry_id: int):
+    """Delete one column-glossary entry (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.glossary import delete_glossary_entry
+    deleted = delete_glossary_entry(entry_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Glossary entry not found")
+    return {"deleted": True}
+
+
+@app.get("/api/agent/presets")
+def api_agent_presets_list(request: Request, enabled_only: bool = False):
+    """List preset questions (audit-token gated).
+
+    The chat UI passes ``enabled_only=true`` to get the clickable
+    shortcuts; the admin UI lists everything including disabled entries.
+    """
+    _require_audit_token(request)
+    from gateway.presets import list_preset_questions
+    return {"items": list_preset_questions(enabled_only=enabled_only)}
+
+
+@app.post("/api/agent/presets")
+def api_agent_presets_upsert(request: Request, body: PresetQuestionRequest):
+    """Create or update one preset question (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.presets import upsert_preset_question
+    try:
+        return upsert_preset_question(
+            body.question, enabled=body.enabled, sort_order=body.sort_order,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/agent/presets/{preset_id}")
+def api_agent_presets_delete(request: Request, preset_id: int):
+    """Delete one preset question (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.presets import delete_preset_question
+    deleted = delete_preset_question(preset_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Preset question not found")
+    return {"deleted": True}
+
+
 @app.get("/api/agent/stats")
 def api_agent_stats(
     request: Request,

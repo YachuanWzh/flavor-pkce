@@ -34,7 +34,9 @@ from gateway.compression import (
     compress_context,
     summarize_via_llm,
 )
+from gateway.glossary import render_glossary_prompt
 from gateway.intent import parse_intent
+from gateway.qa import render_qa_prompt
 from gateway.query import SCHEMA_DESCRIPTIONS, execute_readonly_query
 from gateway.sqlguard import check_sql_safety
 from gateway.terms import render_metric_prompt
@@ -68,13 +70,41 @@ Rules:
 """
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(question: str | None = None) -> str:
+    """Render the system prompt with today's UTC date.
+
+    ``question`` enables context-sensitive few-shot injection: enabled QA
+    pairs whose question overlaps the current user question are appended,
+    and every enabled column-glossary annotation is included.
+    """
     today = datetime.now(timezone.utc).date().isoformat()
     base = _SYSTEM_PROMPT.format(today=today, **SCHEMA_DESCRIPTIONS)
     metric_prompt = render_metric_prompt()
     if metric_prompt:
         base += "\n\n" + metric_prompt
+    glossary_prompt = render_glossary_prompt()
+    if glossary_prompt:
+        base += "\n\n" + glossary_prompt
+    qa_prompt = render_qa_prompt(question)
+    if qa_prompt:
+        base += "\n\n" + qa_prompt
     return base
+
+
+def _current_question(messages: list[dict]) -> str | None:
+    """Most recent real user question in ``messages``.
+
+    Skips feedback/tool-error marker messages produced by the loop itself,
+    so QA few-shot injection always matches against the user's own wording.
+    """
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = (message.get("content") or "").strip()
+        if content.startswith("[feedback]") or content.startswith("[tool error]"):
+            continue
+        return content
+    return None
 
 
 def _default_execute(sql: str) -> dict:
@@ -155,7 +185,9 @@ async def _stream_llm(messages: list[dict], routing: dict | None = None) -> Asyn
     model = cfg["default_model"]
     is_anthropic = cfg["api_type"].lower() == "anthropic" or base.endswith(_ANTHROPIC_SUFFIX)
 
-    system_text, chat = _to_api_messages(messages, _build_system_prompt())
+    system_text, chat = _to_api_messages(
+        messages, _build_system_prompt(question=_current_question(messages)),
+    )
 
     if is_anthropic:
         headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
@@ -302,8 +334,25 @@ async def _run_agent_turn_impl(
 
     yield {"event": "session", "data": {"session_id": session.session_id}}
 
+    # Query rewrite: in a multi-turn session a follow-up question is first
+    # rewritten to be self-contained so references like "它" / "上个月" /
+    # "that error" resolve before intent parsing. Gated on real upstream
+    # routing — tests drive call_llm directly and never route, and a fresh
+    # session has no history to resolve against.
+    effective_question = question
+    if session.messages and routing:
+        yield {"event": "status", "data": {
+            "stage": "rewriting", "message": "Rewriting question…",
+        }}
+        rewritten = await rewrite_question(question, session.messages, routing)
+        if rewritten.strip() != question.strip():
+            effective_question = rewritten.strip()
+            yield {"event": "rewrite", "data": {
+                "original": question, "rewritten": effective_question,
+            }}
+
     await _ensure_compressed(session, routing, threshold_tokens, summarize_fn)
-    session.messages.append({"role": "user", "content": question})
+    session.messages.append({"role": "user", "content": effective_question})
 
     attempts_used = 0
     max_attempts = MAX_REFLECT_RETRIES + 1
@@ -571,3 +620,101 @@ async def _reflect_for_sql(session, call_llm, routing) -> str | None:
         )})
         return None
     return sql
+
+
+# ---------------------------------------------------------------------------
+# Query rewrite (P2-8): make follow-up questions self-contained
+# ---------------------------------------------------------------------------
+
+_MAX_REWRITE_HISTORY_MESSAGES = 8
+_MAX_REWRITE_OUTPUT_CHARS = 500
+
+_REWRITE_SYSTEM_PROMPT = """You are a query-rewriting assistant for a data-analytics agent that answers questions about an LLM gateway audit log.
+The user is continuing a multi-turn conversation. Rewrite their LATEST question into a single, self-contained question that resolves every pronoun, time reference (e.g. "上个月", "最近7天", "it", "that") and context-dependent phrase using only the conversation history below.
+Keep the original meaning, language and intent. Do not invent information that is not present in the history or the question.
+Output ONLY the rewritten question. No explanation, no quotes, no JSON."""
+
+
+def _history_for_rewrite(messages: list[dict], limit: int = _MAX_REWRITE_HISTORY_MESSAGES) -> str:
+    """Compact the recent session messages into a rewrite prompt context."""
+    lines: list[str] = []
+    for message in messages[-limit:]:
+        role = message.get("role")
+        content = (message.get("content") or "").strip()[:_MAX_REWRITE_OUTPUT_CHARS]
+        if not content:
+            continue
+        if role == "summary":
+            lines.append(f"[summary] {content}")
+        elif role == "compressed":
+            lines.append(f"[history] {content}")
+        elif role == "tool":
+            lines.append(f"[tool result] {content}")
+        elif role == "assistant":
+            lines.append(f"[assistant] {content}")
+        else:
+            lines.append(f"[user] {content}")
+    return "\n".join(lines)
+
+
+async def rewrite_question(question: str, messages: list[dict], routing: dict | None) -> str:
+    """Ask the upstream LLM to rewrite a follow-up question to be self-contained.
+
+    Speaks OpenAI /chat/completions by default and the Anthropic Messages
+    API when the upstream is Anthropic-compatible (same detection as the
+    agent transport). On any failure the original question is returned —
+    rewriting is a quality improvement and must never break a turn.
+    """
+    cfg = _routing_config(routing)
+    base = cfg["upstream_url"].rstrip("/")
+    is_anthropic = (
+        cfg["api_type"].lower() == "anthropic"
+        or base.endswith(_ANTHROPIC_SUFFIX)
+    )
+    headers = {"Content-Type": "application/json"}
+    _apply_upstream_auth(headers, cfg["upstream_api_key"], cfg["upstream_auth_type"])
+
+    history = _history_for_rewrite(messages)
+    user_content = f"Conversation history:\n{history}\n\nLatest question: {question}"
+
+    try:
+        if is_anthropic:
+            headers["anthropic-version"] = "2023-06-01"
+            payload = {
+                "model": cfg["default_model"],
+                "max_tokens": 200,
+                "system": _REWRITE_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": user_content}],
+            }
+        else:
+            payload = {
+                "model": cfg["default_model"],
+                "messages": [
+                    {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0,
+            }
+        url = f"{base}/v1/messages" if is_anthropic else f"{base}/chat/completions"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        if is_anthropic:
+            rewritten = "".join(
+                block.get("text", "")
+                for block in data.get("content", [])
+                if block.get("type") == "text"
+            )
+        else:
+            rewritten = data["choices"][0]["message"]["content"]
+    except Exception:
+        return question
+
+    rewritten = (rewritten or "").strip().strip("\"'")
+    if (
+        not rewritten
+        or len(rewritten) > _MAX_REWRITE_OUTPUT_CHARS
+        or rewritten.lower() == question.strip().lower()
+    ):
+        return question
+    return rewritten

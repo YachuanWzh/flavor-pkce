@@ -121,7 +121,17 @@ export default function AgentChat({ variant = "panel", onClose }) {
   const [status, setStatus] = useState("");
   const [sessionId, setSessionId] = useState(null);
   const [pendingConfirm, setPendingConfirm] = useState(null); // {sql, attempt}
+  const [presets, setPresets] = useState([]); // one-click preset questions
   const scrollRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/gw/api/agent/presets?enabled_only=true", { credentials: "include" })
+      .then((resp) => (resp.ok ? resp.json() : { items: [] }))
+      .then((data) => { if (!cancelled) setPresets(data.items || []); })
+      .catch(() => { if (!cancelled) setPresets([]); });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -162,7 +172,9 @@ export default function AgentChat({ variant = "panel", onClose }) {
     let sawError = "";
     await consumeSse(resp, ({ event, data }) => {
       if (event === "session" && data.session_id) setSessionId(data.session_id);
-      else if (event === "status") setStatus(data.message || "");
+      else if (event === "rewrite" && data.rewritten && data.rewritten !== data.original) {
+        appendMessage({ role: "system", kind: "info", text: `Rewrote to: ${data.rewritten}` });
+      } else if (event === "status") setStatus(data.message || "");
       else if (event === "delta") {
         updateLastAssistant((msg) => ({
           ...msg,
@@ -197,19 +209,18 @@ export default function AgentChat({ variant = "panel", onClose }) {
     if (sawError) throw new Error(sawError);
   };
 
-  const send = async (event) => {
-    event.preventDefault();
-    const text = input.trim();
-    if (!text || busy) return;
+  const sendText = async (text) => {
+    const clean = (text || "").trim();
+    if (!clean || busy) return;
     setInput("");
     setBusy(true);
     setStatus("Thinking…");
-    appendMessage({ role: "user", text });
+    appendMessage({ role: "user", text: clean });
     appendMessage({ role: "assistant", text: "", streaming: true });
     setPendingConfirm(null);
     try {
       await runStream("/gw/api/agent/chat", {
-        message: text,
+        message: clean,
         session_id: sessionId,
       });
     } catch (cause) {
@@ -218,6 +229,11 @@ export default function AgentChat({ variant = "panel", onClose }) {
     } finally {
       setBusy(false);
     }
+  };
+
+  const send = async (event) => {
+    event.preventDefault();
+    await sendText(input);
   };
 
   const confirm = async (approved) => {
@@ -261,6 +277,21 @@ export default function AgentChat({ variant = "panel", onClose }) {
             <div className="chat-empty-sub">
               Natural-language questions become read-only SQL — executed only after your confirmation.
             </div>
+            {presets.length > 0 && (
+              <div className="chat-presets">
+                {presets.map((p) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className="chat-preset"
+                    disabled={busy}
+                    onClick={() => sendText(p.question)}
+                  >
+                    {p.question}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         )}
         {messages.map((msg, i) => {

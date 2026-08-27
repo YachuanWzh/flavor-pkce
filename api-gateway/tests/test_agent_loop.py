@@ -498,3 +498,189 @@ def test_blocked_exhaustion_recorded_as_error(store):
     items = query_agent_queries({"page": 1, "page_size": 10})["items"]
     assert len(items) == 1
     assert items[0]["status"] == "blocked"
+
+
+# ---- knowledge prompt injection (glossary + QA few-shot) ------------------
+
+
+def test_system_prompt_includes_glossary_and_qa(monkeypatch):
+    from gateway import glossary, qa
+    from gateway.agent_loop import _build_system_prompt as loop_prompt
+
+    monkeypatch.setattr(
+        glossary, "list_glossary_entries",
+        lambda **kw: [{
+            "table_name": "audit_logs", "column_name": "status",
+            "business_name": "HTTP 状态码", "synonyms": '["状态"]',
+            "description": "200=成功", "enabled": True,
+        }],
+    )
+    monkeypatch.setattr(
+        qa, "match_qa_pairs",
+        lambda question, limit=3: [{
+            "question": "上个月销售额是多少",
+            "sql_template": "SELECT COUNT(*) AS n FROM audit_logs",
+        }],
+    )
+    text = loop_prompt(question="统计上个月的销售额")
+    assert "audit_logs.status" in text
+    assert "HTTP 状态码" in text
+    assert "上个月销售额是多少" in text
+    assert "SELECT COUNT(*) AS n FROM audit_logs" in text
+
+
+def test_current_question_skips_feedback_markers():
+    from gateway.agent_loop import _current_question
+    messages = [
+        {"role": "user", "content": "how many?"},
+        {"role": "assistant", "content": "..."},
+        {"role": "user", "content": "[feedback] invalid JSON"},
+        {"role": "user", "content": "[tool error] no such column"},
+    ]
+    assert _current_question(messages) == "how many?"
+    assert _current_question([]) is None
+
+
+# ---- query rewrite --------------------------------------------------------
+
+
+ROUTING = {
+    "upstream_url": "https://api.openai.com/v1",
+    "upstream_api_key": "k",
+    "upstream_auth_type": "bearer",
+    "default_model": "m",
+    "api_type": "openai",
+}
+
+
+def test_rewrite_runs_when_history_and_routing(store, monkeypatch):
+    """A follow-up question in a multi-turn session is rewritten before the
+    intent loop, and the model sees the rewritten (self-contained) text."""
+    session = store.create()
+    session.messages = [
+        {"role": "user", "content": "how many requests yesterday?"},
+        {"role": "assistant", "content": intent_sql("SELECT COUNT(*) AS n FROM audit_logs")},
+        {"role": "tool", "content": json.dumps({"rows": [{"n": 5}]})},
+    ]
+    rewritten_calls = []
+
+    async def fake_rewrite(question, messages, routing):
+        rewritten_calls.append((question, routing))
+        return "How many requests were there on 2026-08-26?"
+
+    monkeypatch.setattr("gateway.agent_loop.rewrite_question", fake_rewrite)
+    llm, calls = make_llm([intent_sql("SELECT COUNT(*) AS n FROM audit_logs")])
+
+    events = collect(run_agent_turn(
+        "how many were there then?",
+        session=session, call_llm=llm, routing=ROUTING,
+    ))
+    rewrite = events_of(events, "rewrite")[0]["data"]
+    assert rewrite["original"] == "how many were there then?"
+    assert rewrite["rewritten"] == "How many requests were there on 2026-08-26?"
+    # The model saw the rewritten question, not the original.
+    seen = calls["messages_seen"][0]
+    assert any(
+        "How many requests were there on 2026-08-26?" in m.get("content", "")
+        for m in seen
+    )
+    assert len(rewritten_calls) == 1
+
+
+def test_rewrite_skipped_without_history(store, monkeypatch):
+    session = store.create()
+
+    async def fake_rewrite(question, messages, routing):
+        raise AssertionError("rewrite must not run on a fresh session")
+
+    monkeypatch.setattr("gateway.agent_loop.rewrite_question", fake_rewrite)
+    llm, _ = make_llm([intent_sql("SELECT COUNT(*) AS n FROM audit_logs")])
+    events = collect(run_agent_turn(
+        "how many?", session=session, call_llm=llm, routing=ROUTING,
+    ))
+    assert events_of(events, "rewrite") == []
+
+
+def test_rewrite_skipped_without_routing(store, monkeypatch):
+    """Tests drive call_llm without routing — no upstream rewrite call."""
+    session = store.create()
+    session.messages = [{"role": "user", "content": "old question"}]
+
+    async def fake_rewrite(question, messages, routing):
+        raise AssertionError("rewrite must not run without routing")
+
+    monkeypatch.setattr("gateway.agent_loop.rewrite_question", fake_rewrite)
+    llm, _ = make_llm([intent_sql("SELECT COUNT(*) AS n FROM audit_logs")])
+    events = collect(run_agent_turn(
+        "how many?", session=session, call_llm=llm,
+    ))
+    assert events_of(events, "rewrite") == []
+
+
+def test_rewrite_no_event_when_rewritten_equals_original(store, monkeypatch):
+    session = store.create()
+    session.messages = [{"role": "user", "content": "old question"}]
+
+    async def fake_rewrite(question, messages, routing):
+        return question
+
+    monkeypatch.setattr("gateway.agent_loop.rewrite_question", fake_rewrite)
+    llm, _ = make_llm([intent_sql("SELECT COUNT(*) AS n FROM audit_logs")])
+    events = collect(run_agent_turn(
+        "how many?", session=session, call_llm=llm, routing=ROUTING,
+    ))
+    assert events_of(events, "rewrite") == []
+    # The original question was appended (no rewrite event, no replacement).
+    assert any(
+        m.get("content") == "how many?" and m.get("role") == "user"
+        for m in session.messages
+    )
+
+
+def test_rewrite_question_openai_payload(monkeypatch):
+    from gateway.agent_loop import rewrite_question
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "Rewritten question?"}}]}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def fake_post(self, url, *, headers=None, json=None, timeout=None):
+        calls.append((url, headers, json))
+        return FakeResponse()
+
+    monkeypatch.setattr("gateway.agent_loop.httpx.AsyncClient.post", fake_post)
+    result = asyncio.run(rewrite_question(
+        "how many were there?",
+        [{"role": "user", "content": "old question"}],
+        ROUTING,
+    ))
+    assert result == "Rewritten question?"
+    assert calls[0][0].endswith("/chat/completions")
+    assert "Conversation history" in calls[0][2]["messages"][1]["content"]
+
+
+def test_rewrite_question_falls_back_on_error(monkeypatch):
+    from gateway.agent_loop import rewrite_question
+
+    async def fake_post(self, url, *, headers=None, json=None, timeout=None):
+        raise RuntimeError("upstream down")
+
+    monkeypatch.setattr("gateway.agent_loop.httpx.AsyncClient.post", fake_post)
+    result = asyncio.run(rewrite_question(
+        "how many?",
+        [{"role": "user", "content": "old question"}],
+        ROUTING,
+    ))
+    assert result == "how many?"
