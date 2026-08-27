@@ -6,6 +6,7 @@ when the context window fills up. Sessions live in process memory with a
 TTL and a hard capacity bound (LRU-style eviction of the oldest entry).
 """
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -27,6 +28,9 @@ class SessionState:
     pending_sql: str | None = None
     pending_question: str | None = None
     pending_attempt: int = 0
+    # Serialises concurrent chat/confirm requests on this session so turns
+    # cannot interleave at await points or double-execute pending SQL.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class SessionStore:

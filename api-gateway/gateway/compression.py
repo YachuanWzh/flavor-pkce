@@ -18,7 +18,7 @@ import httpx
 import gateway.config
 
 RECENT_TURNS_KEPT = 5
-_TURN_FIELD_LIMIT = 200
+_TURN_FIELD_LIMIT = 120
 SUMMARY_TOKEN_THRESHOLD = int(os.environ.get("AGENT_CONTEXT_TOKENS", "4000"))
 
 SUMMARY_SYSTEM_PROMPT = """You are a context-compression assistant. Summarise the
@@ -143,47 +143,82 @@ def compress_context(
     }
 
 
-def _resolve_upstream(routing: dict | None) -> tuple[str, str, str, str]:
-    """(base_url, api_key, auth_type, model) from routing or gateway env."""
+_ANTHROPIC_SUFFIX = "/anthropic"
+
+
+def _resolve_upstream(routing: dict | None) -> dict:
+    """Upstream call config from routing or gateway env."""
     if routing:
-        return (
-            str(routing.get("upstream_url") or gateway.config.UPSTREAM_URL).rstrip("/"),
-            str(routing.get("upstream_api_key") or gateway.config.UPSTREAM_API_KEY),
-            str(routing.get("upstream_auth_type") or gateway.config.UPSTREAM_AUTH_TYPE),
-            str(routing.get("default_model") or gateway.config.UPSTREAM_MODEL),
-        )
-    return (
-        gateway.config.UPSTREAM_URL.rstrip("/"),
-        gateway.config.UPSTREAM_API_KEY,
-        gateway.config.UPSTREAM_AUTH_TYPE,
-        gateway.config.UPSTREAM_MODEL,
-    )
+        return {
+            "base": str(routing.get("upstream_url") or gateway.config.UPSTREAM_URL).rstrip("/"),
+            "api_key": str(routing.get("upstream_api_key") or gateway.config.UPSTREAM_API_KEY),
+            "auth_type": str(routing.get("upstream_auth_type") or gateway.config.UPSTREAM_AUTH_TYPE),
+            "model": str(routing.get("default_model") or gateway.config.UPSTREAM_MODEL),
+            "api_type": str(routing.get("api_type") or ""),
+        }
+    return {
+        "base": gateway.config.UPSTREAM_URL.rstrip("/"),
+        "api_key": gateway.config.UPSTREAM_API_KEY,
+        "auth_type": gateway.config.UPSTREAM_AUTH_TYPE,
+        "model": gateway.config.UPSTREAM_MODEL,
+        "api_type": "",
+    }
+
+
+def _apply_auth(headers: dict, api_key: str, auth_type: str) -> None:
+    if not api_key:
+        return
+    if auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif auth_type == "api-key":
+        headers["api-key"] = api_key
+    else:
+        headers["x-api-key"] = api_key
 
 
 async def summarize_via_llm(routing: dict | None, text: str) -> str:
-    """Ask the configured upstream LLM for the whole-context summary."""
-    base, api_key, auth_type, model = _resolve_upstream(routing)
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        if auth_type == "bearer":
-            headers["Authorization"] = f"Bearer {api_key}"
-        elif auth_type == "api-key":
-            headers["api-key"] = api_key
-        else:
-            headers["x-api-key"] = api_key
+    """Ask the configured upstream LLM for the whole-context summary.
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": text[:20000]},
-        ],
-        "temperature": 0,
-    }
+    Speaks OpenAI /chat/completions by default and the Anthropic Messages
+    API when the upstream is Anthropic-compatible (same detection as the
+    agent transport), so strategy B works for every routed upstream.
+    """
+    cfg = _resolve_upstream(routing)
+    base, api_key, auth_type, model = cfg["base"], cfg["api_key"], cfg["auth_type"], cfg["model"]
+    is_anthropic = cfg["api_type"].lower() == "anthropic" or base.endswith(_ANTHROPIC_SUFFIX)
+
+    headers = {"Content-Type": "application/json"}
+    _apply_auth(headers, api_key, auth_type)
+
+    if is_anthropic:
+        headers["anthropic-version"] = "2023-06-01"
+        url = f"{base}/v1/messages"
+        payload = {
+            "model": model,
+            "max_tokens": 2048,
+            "system": SUMMARY_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": text[:20000]}],
+        }
+    else:
+        url = f"{base}/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": text[:20000]},
+            ],
+            "temperature": 0,
+        }
+
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            f"{base}/chat/completions", headers=headers, json=payload,
-        )
+        resp = await client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
+
+    if is_anthropic:
+        return "".join(
+            block.get("text", "")
+            for block in data.get("content", [])
+            if block.get("type") == "text"
+        )
     return data["choices"][0]["message"]["content"]

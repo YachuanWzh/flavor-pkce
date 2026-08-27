@@ -24,7 +24,6 @@ Events emitted (SSE-friendly dicts): ``session``, ``status``, ``delta``,
 import json
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from functools import partial
 
 import httpx
 
@@ -209,19 +208,41 @@ def _record_audit(
         pass
 
 
-async def _generate_once(session, call_llm, routing):
-    """One LLM round-trip: stream deltas, return (events, full_text)."""
-    events = [
-        {"event": "status", "data": {"stage": "generating", "message": "Generating…"}},
-    ]
-    parts: list[str] = []
+def _generate_once(session, call_llm, routing, collect_into: list[str]):
+    """One LLM round-trip as a live event stream.
+
+    Yields status + each delta as the model produces it (no buffering);
+    the full text is accumulated into ``collect_into`` for the caller.
+    """
+    return _generate_once_impl(session, call_llm, routing, collect_into)
+
+
+async def _generate_once_impl(session, call_llm, routing, collect_into: list[str]) -> AsyncIterator[dict]:
+    yield {"event": "status", "data": {"stage": "generating", "message": "Generating…"}}
     async for text in call_llm(_build_llm_messages(session), routing=routing):
-        parts.append(text)
-        events.append({"event": "delta", "data": {"text": text}})
-    return events, "".join(parts)
+        collect_into.append(text)
+        yield {"event": "delta", "data": {"text": text}}
 
 
-async def run_agent_turn(
+async def run_agent_turn(question, session, call_llm=None, routing=None,
+                         user="-", user_id=None, execute_fn=None,
+                         threshold_tokens=None, summarize_fn=None):
+    """Run one user question through the intent loop until it needs a
+    human SQL confirmation or finishes with a direct answer.
+
+    Concurrent turns on the same session are serialised by the session
+    lock, so messages never interleave at await points.
+    """
+    async with session.lock:
+        async for event in _run_agent_turn_impl(
+            question, session, call_llm=call_llm, routing=routing,
+            user=user, user_id=user_id, execute_fn=execute_fn,
+            threshold_tokens=threshold_tokens, summarize_fn=summarize_fn,
+        ):
+            yield event
+
+
+async def _run_agent_turn_impl(
     question: str,
     session,
     call_llm: AsyncIterator | None = None,
@@ -232,8 +253,7 @@ async def run_agent_turn(
     threshold_tokens: int | None = None,
     summarize_fn=None,
 ) -> AsyncIterator[dict]:
-    """Run one user question through the intent loop until it needs a
-    human SQL confirmation or finishes with a direct answer."""
+    """Unlocked implementation of :func:`run_agent_turn`."""
     if call_llm is None:
         call_llm = _stream_llm
     if not question or not question.strip():
@@ -250,9 +270,10 @@ async def run_agent_turn(
     max_attempts = MAX_REFLECT_RETRIES + 1
     while attempts_used < max_attempts:
         attempts_used += 1
-        events, full_text = await _generate_once(session, call_llm, routing)
-        for event in events:
+        parts: list[str] = []
+        async for event in _generate_once(session, call_llm, routing, parts):
             yield event
+        full_text = "".join(parts)
 
         intent = parse_intent(full_text)
         if intent is None:
@@ -339,7 +360,28 @@ async def run_agent_turn(
         return
 
 
-async def confirm_agent_turn(
+async def confirm_agent_turn(session, approved, call_llm=None, routing=None,
+                             user="-", user_id=None, execute_fn=None,
+                             threshold_tokens=None, summarize_fn=None):
+    """Resolve a pending SQL confirmation.
+
+    Approved SQL executes read-only; failures trigger reflection retries
+    (each regenerated SQL goes back to ``confirmation_required``).
+
+    Concurrent confirms on the same session are serialised by the session
+    lock — a second confirm sees ``pending_sql`` already cleared and
+    reports that nothing is awaiting confirmation.
+    """
+    async with session.lock:
+        async for event in _confirm_agent_turn_impl(
+            session, approved, call_llm=call_llm, routing=routing,
+            user=user, user_id=user_id, execute_fn=execute_fn,
+            threshold_tokens=threshold_tokens, summarize_fn=summarize_fn,
+        ):
+            yield event
+
+
+async def _confirm_agent_turn_impl(
     session,
     approved: bool,
     call_llm: AsyncIterator | None = None,
@@ -350,11 +392,7 @@ async def confirm_agent_turn(
     threshold_tokens: int | None = None,
     summarize_fn=None,
 ) -> AsyncIterator[dict]:
-    """Resolve a pending SQL confirmation.
-
-    Approved SQL executes read-only; failures trigger reflection retries
-    (each regenerated SQL goes back to ``confirmation_required``).
-    """
+    """Unlocked implementation of :func:`confirm_agent_turn`."""
     if call_llm is None:
         call_llm = _stream_llm
     if execute_fn is None:
@@ -467,8 +505,10 @@ async def _reflect_for_sql(session, call_llm, routing) -> str | None:
     valid intent JSON. The attempt count is advanced by the caller via
     ``session.pending_attempt``.
     """
-    events, full_text = await _generate_once(session, call_llm, routing)
-    # Deltas from reflection are internal — do not surface them as events.
+    parts: list[str] = []
+    async for _event in _generate_once(session, call_llm, routing, parts):
+        pass  # Deltas from reflection are internal — never surfaced.
+    full_text = "".join(parts)
     intent = parse_intent(full_text)
     if intent is None or intent["intent"] != "query_data" or not intent.get("sql"):
         session.messages.append({"role": "assistant", "content": full_text})
