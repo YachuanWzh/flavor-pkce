@@ -17,6 +17,7 @@ class SessionState:
 
     session_id: str
     user_id: str | None = None
+    user: str | None = None
     messages: list[dict] = field(default_factory=list)
     summary: str | None = None
     created_at: float = field(default_factory=time.monotonic)

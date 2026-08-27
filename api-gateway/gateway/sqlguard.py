@@ -56,8 +56,6 @@ def check_sql_safety(sql: str) -> tuple[bool, str | None]:
     stripped = _strip_comments(sql).strip()
     if not stripped:
         return False, "Empty SQL statement"
-    if not _ALLOWED_START.match(stripped):
-        return False, "Only SELECT statements are allowed"
 
     masked = _mask_literals(stripped)
     if ";" in masked.rstrip(";"):
@@ -67,5 +65,8 @@ def check_sql_safety(sql: str) -> tuple[bool, str | None]:
     if m:
         keyword = m.group(1).upper()
         return False, f"Statement contains disallowed keyword: {keyword}"
+
+    if not _ALLOWED_START.match(stripped):
+        return False, "Only SELECT statements are allowed"
 
     return True, None
