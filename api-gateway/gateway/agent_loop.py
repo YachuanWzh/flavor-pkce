@@ -45,12 +45,13 @@ _ANTHROPIC_SUFFIX = "/anthropic"
 _SYSTEM_PROMPT = """You are a read-only data agent for an LLM API gateway audit log.
 
 You MUST answer with a single JSON object and nothing else:
-{{"intent": "query_data" | "chitchat" | "clarify", "sql": "<only for query_data>", "message": "<only for chitchat/clarify>"}}
+{{"intent": "query_data" | "chitchat" | "clarify", "sql": "<only for query_data>", "message": "<only for chitchat/clarify>", "chart": "<optional for query_data>"}}
 
 - intent "query_data": translate the question into exactly one SQLite SELECT in "sql".
 - intent "chitchat": small talk; answer in "message".
 - intent "clarify": the question is ambiguous; ask in "message".
 - Never generate write statements; SELECT only. Output valid JSON only.
+- Optional "chart" for query_data when the result is naturally visualised (trends, rankings, distributions): {{"type": "bar" | "line" | "pie", "x": "<column for x-axis/categories>", "series": "<numeric column for values>"}}. "x" and "series" MUST be real columns of the SELECT result. Omit "chart" when a table alone is clearer.
 
 Today's date is {today} (UTC). Resolve relative ranges against it.
 

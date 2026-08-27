@@ -215,6 +215,14 @@ def test_system_prompt_includes_metric_terms(monkeypatch):
     assert "命中率" in text
 
 
+def test_system_prompt_instructs_chart_output():
+    from gateway.agent_loop import _SYSTEM_PROMPT
+
+    assert '"chart"' in _SYSTEM_PROMPT
+    # The prompt must tell the model which chart types it may suggest.
+    assert "bar" in _SYSTEM_PROMPT and "line" in _SYSTEM_PROMPT and "pie" in _SYSTEM_PROMPT
+
+
 # ---- reflection retries ----------------------------------------------------
 
 
