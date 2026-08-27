@@ -351,6 +351,7 @@ async def _run_agent_turn_impl(
         session.pending_sql = sql
         session.pending_question = question
         session.pending_attempt = attempts_used
+        session.pending_chart = intent.get("chart")
         session.user = user
         session.user_id = user_id
         yield {"event": "confirmation_required", "data": {
@@ -409,6 +410,7 @@ async def _confirm_agent_turn_impl(
         session.pending_sql = None
         session.pending_question = None
         session.pending_attempt = 0
+        session.pending_chart = None
         yield {"event": "rejected", "data": {}}
         yield {"event": "done", "data": {}}
         return
@@ -485,15 +487,20 @@ async def _confirm_agent_turn_impl(
              "rows": result.get("rows"), "truncated": result.get("truncated")},
             ensure_ascii=False, default=str,
         )})
+        chart = session.pending_chart
         session.pending_sql = None
         session.pending_question = None
         session.pending_attempt = 0
+        session.pending_chart = None
         _record_audit(
             user=audit_user, user_id=audit_user_id, question=question,
             sql=sql, status="success",
             rows_returned=len(result.get("rows") or []),
         )
-        yield {"event": "result", "data": {"sql": sql, **result}}
+        result_data = {"sql": sql, **result}
+        if chart is not None:
+            result_data["chart"] = chart
+        yield {"event": "result", "data": result_data}
         yield {"event": "done", "data": {}}
         return
 

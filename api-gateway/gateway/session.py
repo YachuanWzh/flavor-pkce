@@ -28,6 +28,8 @@ class SessionState:
     pending_sql: str | None = None
     pending_question: str | None = None
     pending_attempt: int = 0
+    # Optional chart suggestion produced with the pending SQL (P0 charting).
+    pending_chart: dict | None = None
     # Serialises concurrent chat/confirm requests on this session so turns
     # cannot interleave at await points or double-execute pending SQL.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)

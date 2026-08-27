@@ -168,6 +168,35 @@ def test_confirm_without_pending_sql_errors(store):
     assert events_of(events, "error")
 
 
+# ---- chart suggestions -----------------------------------------------------
+
+
+def test_chart_flows_from_intent_to_result(store):
+    session = store.create()
+    sql = "SELECT date, requests FROM v_audit_daily"
+    chart = {"type": "line", "x": "date", "series": "requests"}
+    llm, _ = make_llm([json.dumps({"intent": "query_data", "sql": sql, "chart": chart})])
+
+    run_events = collect(run_agent_turn("show trend", session=session, call_llm=llm))
+    conf = events_of(run_events, "confirmation_required")[0]
+    assert conf["data"]["sql"] == sql
+
+    confirm_events = collect(confirm_agent_turn(session, True, call_llm=llm))
+    result = events_of(confirm_events, "result")[0]
+    assert result["data"]["chart"] == chart
+
+
+def test_chart_cleared_on_rejection(store):
+    session = store.create()
+    sql = "SELECT date, requests FROM v_audit_daily"
+    chart = {"type": "line", "x": "date", "series": "requests"}
+    llm, _ = make_llm([json.dumps({"intent": "query_data", "sql": sql, "chart": chart})])
+
+    collect(run_agent_turn("show trend", session=session, call_llm=llm))
+    collect(confirm_agent_turn(session, False, call_llm=llm))
+    assert session.pending_chart is None
+
+
 # ---- reflection retries ----------------------------------------------------
 
 
