@@ -197,6 +197,29 @@ def test_chart_cleared_on_rejection(store):
     assert session.pending_chart is None
 
 
+def test_auto_chart_inferred_when_llm_omits_chart(store):
+    session = store.create()
+    # LLM returns NO chart field; result has a date column + numeric column.
+    sql = "SELECT substr(timestamp, 1, 10) AS date, COUNT(*) AS requests FROM audit_logs GROUP BY date"
+    llm, _ = make_llm([intent_sql(sql)])
+    collect(run_agent_turn("daily trend", session=session, call_llm=llm))
+
+    events = collect(confirm_agent_turn(session, True, call_llm=llm))
+    result = events_of(events, "result")[0]
+    assert result["data"]["chart"] == {"type": "line", "x": "date", "series": "requests"}
+
+
+def test_no_auto_chart_without_date_column(store):
+    session = store.create()
+    sql = "SELECT COUNT(*) AS n FROM audit_logs"
+    llm, _ = make_llm([intent_sql(sql)])
+    collect(run_agent_turn("how many", session=session, call_llm=llm))
+
+    events = collect(confirm_agent_turn(session, True, call_llm=llm))
+    result = events_of(events, "result")[0]
+    assert "chart" not in result["data"]
+
+
 # ---- metric-term prompt injection ------------------------------------------
 
 

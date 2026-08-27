@@ -81,6 +81,39 @@ def _default_execute(sql: str) -> dict:
     return execute_readonly_query(sql, max_rows=100, allow_sensitive_columns=False)
 
 
+_DATE_COLUMN_HINTS = frozenset({"date", "day", "dt", "timestamp", "time", "datetime"})
+
+
+def _infer_chart_from_result(result: dict) -> dict | None:
+    """Infer a line chart when the result looks like a time series.
+
+    Fallback for when the model omitted a ``chart`` suggestion but the
+    query result contains an obvious date column plus a numeric column
+    (e.g. daily request counts). Returns None when no suitable columns
+    exist so plain tables stay plain.
+    """
+    columns = result.get("columns") or []
+    rows = result.get("rows") or []
+    if not columns or not rows or not isinstance(rows[0], dict):
+        return None
+    lowered = {c: c.lower() for c in columns}
+    date_col = next(
+        (c for c in columns if lowered[c] in _DATE_COLUMN_HINTS or "date" in lowered[c]),
+        None,
+    )
+    if date_col is None:
+        return None
+    for c in columns:
+        if c == date_col:
+            continue
+        try:
+            float(rows[0].get(c))
+        except (TypeError, ValueError):
+            continue
+        return {"type": "line", "x": date_col, "series": c}
+    return None
+
+
 def _build_llm_messages(session, extra: list[dict] | None = None) -> list[dict]:
     """Session history + current question as LLM messages (raw roles).
 
@@ -494,6 +527,8 @@ async def _confirm_agent_turn_impl(
             ensure_ascii=False, default=str,
         )})
         chart = session.pending_chart
+        if chart is None:
+            chart = _infer_chart_from_result(result)
         session.pending_sql = None
         session.pending_question = None
         session.pending_attempt = 0
