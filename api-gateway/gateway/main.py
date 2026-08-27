@@ -444,6 +444,16 @@ class AgentAskRequest(BaseModel):
     history: list[dict] = []
 
 
+class AgentChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+
+
+class AgentConfirmRequest(BaseModel):
+    session_id: str
+    approved: bool
+
+
 def _agent_identity(payload: dict) -> tuple[str, str | None]:
     """Human-readable username + stable user id for agent audit records."""
     user = payload.get("username") or payload.get("sub") or "-"
@@ -545,6 +555,132 @@ async def api_agent_ask_stream(request: Request, body: AgentAskRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Session-based agent chat (agent loop, SSE, human SQL confirmation)
+# ---------------------------------------------------------------------------
+
+from gateway.session import SessionStore  # noqa: E402
+
+_CHAT_SESSIONS = SessionStore(ttl_seconds=3600.0, max_sessions=2048)
+
+
+def _sse_encode(event: str, data: dict) -> str:
+    payload_json = _json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload_json}\n\n"
+
+
+def _sse_response(source) -> StreamingResponse:
+    return StreamingResponse(
+        source,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _chat_stream_events(question, *, session, routing, user, user_id):
+    """Default event source: one agent-loop turn against the upstream LLM."""
+    from gateway.agent_loop import run_agent_turn
+    async for event in run_agent_turn(
+        question, session=session, routing=routing, user=user, user_id=user_id,
+    ):
+        yield event
+
+
+async def _confirm_stream_events(session, approved, *, routing, user, user_id):
+    """Default event source: resolve a pending SQL confirmation."""
+    from gateway.agent_loop import confirm_agent_turn
+    async for event in confirm_agent_turn(
+        session, approved, routing=routing, user=user, user_id=user_id,
+    ):
+        yield event
+
+
+@app.post("/api/agent/chat")
+async def api_agent_chat(request: Request, body: AgentChatRequest):
+    """Session-based agent chat streamed over SSE.
+
+    The server owns the conversation (unbounded history, compressed in
+    two levels when the token budget is exceeded). Generated SQL is
+    NEVER executed here — the stream emits ``confirmation_required`` and
+    waits for ``/api/agent/chat/confirm`` (human-in-the-loop).
+    """
+    payload = _require_audit_token(request)
+    if not body.message or not body.message.strip():
+        raise HTTPException(status_code=400, detail="Message is empty")
+    routing, err = await _resolve_user_routing(payload)
+    if err is not None:
+        return err
+    user, user_id = _agent_identity(payload)
+
+    session = _CHAT_SESSIONS.get(body.session_id) if body.session_id else None
+    if session is None:
+        session = _CHAT_SESSIONS.create(user_id=user_id)
+        session.user = user
+    _CHAT_SESSIONS.touch(session.session_id)
+
+    async def event_source():
+        try:
+            async for item in _chat_stream_events(
+                body.message, session=session, routing=routing,
+                user=user, user_id=user_id,
+            ):
+                yield _sse_encode(item["event"], item["data"])
+        except httpx.HTTPStatusError as exc:
+            status = getattr(exc.response, "status_code", None)
+            message = (
+                f"Upstream LLM returned HTTP {status}"
+                if status is not None
+                else "Upstream LLM request failed"
+            )
+            yield _sse_encode("error", {"message": message})
+        except httpx.HTTPError as exc:
+            yield _sse_encode("error", {"message": f"Upstream LLM error: {exc}"})
+        except ValueError as exc:
+            yield _sse_encode("error", {"message": str(exc)})
+        except Exception:
+            yield _sse_encode("error", {"message": "Agent stream failed"})
+
+    return _sse_response(event_source())
+
+
+@app.post("/api/agent/chat/confirm")
+async def api_agent_chat_confirm(request: Request, body: AgentConfirmRequest):
+    """Approve or reject the SQL awaiting human confirmation (streamed SSE).
+
+    Approved SQL runs read-only; execution failures are reflected back to
+    the model (up to 3 retries) and each regenerated SQL requires a fresh
+    confirmation.
+    """
+    payload = _require_audit_token(request)
+    session = _CHAT_SESSIONS.get(body.session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    routing, err = await _resolve_user_routing(payload)
+    if err is not None:
+        return err
+    user, user_id = _agent_identity(payload)
+    _CHAT_SESSIONS.touch(session.session_id)
+
+    async def event_source():
+        try:
+            async for item in _confirm_stream_events(
+                session=session, approved=body.approved, routing=routing,
+                user=user, user_id=user_id,
+            ):
+                yield _sse_encode(item["event"], item["data"])
+        except httpx.HTTPError as exc:
+            yield _sse_encode("error", {"message": f"Agent error: {exc}"})
+        except ValueError as exc:
+            yield _sse_encode("error", {"message": str(exc)})
+        except Exception:
+            yield _sse_encode("error", {"message": "Agent confirm failed"})
+
+    return _sse_response(event_source())
 
 
 # ---------------------------------------------------------------------------
