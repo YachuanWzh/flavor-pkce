@@ -106,6 +106,15 @@ def init_audit_db() -> None:
             model          TEXT,
             status         TEXT    NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS metric_terms (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            term       TEXT    NOT NULL UNIQUE,
+            definition TEXT    NOT NULL,
+            synonyms   TEXT    NOT NULL DEFAULT '[]',
+            enabled    INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT    NOT NULL
+        );
     """)
     # Migrate existing databases that lack newer columns.
     for col, col_type in (
