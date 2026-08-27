@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as echarts from "echarts";
+import AgentChat from "./AgentChat";
 
 const PALETTE = ["#5b8def", "#34d399", "#f87171", "#fbbf24", "#a78bfa", "#22d3ee"];
 
@@ -59,6 +60,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [data, setData] = useState(null);
+  const [chatOpen, setChatOpen] = useState(false);
 
   const tokensRef = useRef(null);
   const requestsRef = useRef(null);
@@ -224,6 +226,28 @@ export default function DashboardPage() {
             <div className="dashboard-panel"><h2>Cost by user</h2><div ref={costUsersRef} className="chart" /></div>
           </div>
         </>
+      )}
+
+      {/* Floating data-agent chatbot (requirement 5) */}
+      <button
+        className="chatbot-fab"
+        onClick={() => setChatOpen((open) => !open)}
+        aria-label={chatOpen ? "Close data agent chat" : "Open data agent chat"}
+      >
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="4" y="8" width="16" height="12" rx="3" stroke="currentColor" strokeWidth="1.8" />
+          <path d="M12 8V5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+          <circle cx="12" cy="4" r="1.6" fill="currentColor" />
+          <circle cx="9" cy="13.5" r="1.4" fill="currentColor" />
+          <circle cx="15" cy="13.5" r="1.4" fill="currentColor" />
+          <path d="M9.5 17h5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      </button>
+
+      {chatOpen && (
+        <div className="chatbot-panel">
+          <AgentChat variant="panel" onClose={() => setChatOpen(false)} />
+        </div>
       )}
     </main>
   );
