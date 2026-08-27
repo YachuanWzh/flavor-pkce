@@ -520,6 +520,23 @@ def api_agent_metrics_delete(request: Request, term_id: int):
     return {"deleted": True}
 
 
+@app.get("/api/agent/stats")
+def api_agent_stats(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+):
+    """Aggregated data-agent usage stats (audit-token gated)."""
+    _require_audit_token(request)
+    from gateway.database import agent_query_stats
+    return agent_query_stats({
+        "start_date": start_date,
+        "end_date": end_date,
+        "user": user,
+    })
+
+
 @app.post("/api/agent/ask")
 async def api_agent_ask(request: Request, body: AgentAskRequest):
     """Translate a natural-language question to SQL and run it read-only.

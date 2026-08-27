@@ -470,3 +470,72 @@ def query_agent_queries(
         "page_size": page_size,
         "items": [dict(row) for row in rows],
     }
+
+
+def agent_query_stats(params: QueryParams) -> dict:
+    """Aggregate data-agent usage: totals, daily series, error top."""
+    conditions: list[str] = []
+    bindings: list[object] = []
+    if params.get("start_date"):
+        conditions.append("timestamp >= ?")
+        bindings.append(params["start_date"] + "T00:00:00+00:00")
+    if params.get("end_date"):
+        conditions.append("timestamp <= ?")
+        bindings.append(params["end_date"] + "T23:59:59.999999+00:00")
+    if params.get("user"):
+        conditions.append('"user" = ?')
+        bindings.append(params["user"])
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    conn = _connect()
+    try:
+        row = conn.execute(
+            f"""SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+                       SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error,
+                       SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked,
+                       ROUND(AVG(CASE WHEN duration_ms > 0 THEN duration_ms END), 2) AS avg_duration_ms,
+                       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+                FROM agent_queries {where}""",
+            bindings,
+        ).fetchone()
+        daily = conn.execute(
+            f"""SELECT substr(timestamp, 1, 10) AS date,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+                       SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error,
+                       SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked
+                FROM agent_queries {where}
+                GROUP BY date ORDER BY date""",
+            bindings,
+        ).fetchall()
+        if where:
+            error_rows = conn.execute(
+                f"""SELECT COALESCE(error, 'unknown') AS error, COUNT(*) AS count
+                    FROM agent_queries {where} AND error IS NOT NULL
+                    GROUP BY error ORDER BY count DESC LIMIT 10""",
+                bindings,
+            ).fetchall()
+        else:
+            error_rows = conn.execute(
+                """SELECT COALESCE(error, 'unknown') AS error, COUNT(*) AS count
+                   FROM agent_queries WHERE error IS NOT NULL
+                   GROUP BY error ORDER BY count DESC LIMIT 10"""
+            ).fetchall()
+    finally:
+        conn.close()
+
+    total = row["total"] or 0
+    return {
+        "total": total,
+        "success": row["success"] or 0,
+        "error": row["error"] or 0,
+        "blocked": row["blocked"] or 0,
+        "success_rate": round((row["success"] or 0) / total, 4) if total else 0.0,
+        "avg_duration_ms": row["avg_duration_ms"],
+        "prompt_tokens": row["prompt_tokens"],
+        "completion_tokens": row["completion_tokens"],
+        "daily": [dict(r) for r in daily],
+        "error_top": [dict(r) for r in error_rows],
+    }
