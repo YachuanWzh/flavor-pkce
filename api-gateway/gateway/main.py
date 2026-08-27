@@ -402,6 +402,20 @@ def api_stats_models(
     return {"items": stats.top_models(start_date, end_date, user, limit)}
 
 
+@app.get("/api/stats/cost")
+def api_stats_cost(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+    group_by: str | None = Query(None),
+):
+    """Estimated USD spend per day, or grouped by user/model/service (P1-4)."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.cost_usage(start_date, end_date, user, group_by)}
+
+
 class QueryRequest(BaseModel):
     sql: str
 
@@ -427,6 +441,34 @@ def api_query(request: Request, body: QueryRequest):
 
 class AgentAskRequest(BaseModel):
     question: str
+    history: list[dict] = []
+
+
+def _agent_identity(payload: dict) -> tuple[str, str | None]:
+    """Human-readable username + stable user id for agent audit records."""
+    user = payload.get("username") or payload.get("sub") or "-"
+    return str(user), payload.get("sub")
+
+
+@app.get("/api/agent/queries")
+def api_agent_queries(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+):
+    """Paginated history of data-agent interactions (P0-1 audit trail)."""
+    _require_audit_token(request)
+    from gateway.database import query_agent_queries
+    return query_agent_queries({
+        "page": page,
+        "page_size": page_size,
+        "start_date": start_date,
+        "end_date": end_date,
+        "user": user,
+    })
 
 
 @app.post("/api/agent/ask")
@@ -436,14 +478,19 @@ async def api_agent_ask(request: Request, body: AgentAskRequest):
     Uses the signed-in user's own LLM config (resolved from the JWT, the
     same way the proxy resolves routing) so the agent speaks to the
     upstream with the user's credentials, not the gateway-wide env key.
+    Every interaction is recorded in the agent_queries audit table (P0-1).
     """
     payload = _require_audit_token(request)
     routing, err = await _resolve_user_routing(payload)
     if err is not None:
         return err
+    user, user_id = _agent_identity(payload)
     from gateway.agent import ask_agent
     try:
-        return await ask_agent(body.question, routing=routing)
+        return await ask_agent(
+            body.question, routing=routing, user=user, user_id=user_id,
+            history=body.history,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except httpx.HTTPError as exc:
@@ -460,6 +507,7 @@ async def api_agent_ask_stream(request: Request, body: AgentAskRequest):
     routing, err = await _resolve_user_routing(payload)
     if err is not None:
         return err
+    user, user_id = _agent_identity(payload)
 
     from gateway.agent import stream_agent
 
@@ -469,7 +517,10 @@ async def api_agent_ask_stream(request: Request, body: AgentAskRequest):
 
     async def event_source():
         try:
-            async for item in stream_agent(body.question, routing=routing):
+            async for item in stream_agent(
+                body.question, routing=routing, user=user, user_id=user_id,
+                history=body.history,
+            ):
                 yield encode(item["event"], item["data"])
         except httpx.HTTPStatusError as exc:
             status = getattr(exc.response, "status_code", None)

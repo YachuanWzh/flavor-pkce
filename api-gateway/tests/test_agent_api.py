@@ -176,7 +176,7 @@ def test_ask_uses_signed_in_users_llm_config(client):
 
 
 def test_ask_stream_returns_sse_events(client):
-    async def fake_stream_agent(question, routing=None):
+    async def fake_stream_agent(question, routing=None, user="-", user_id=None, history=None):
         assert question == "how many?"
         yield {"event": "status", "data": {"message": "Generating SQL…"}}
         yield {"event": "delta", "data": {"text": "SELECT 1 AS n"}}
@@ -211,3 +211,51 @@ def test_ask_stream_empty_question_is_400(client):
         "/api/agent/ask/stream", headers=AUTH, json={"question": "  "},
     )
     assert response.status_code == 400
+
+
+def test_ask_passes_history_to_agent(client):
+    """P2-6: the /api/agent/ask endpoint forwards conversation history."""
+    fake = _FakeResponse(200, {
+        "choices": [{"message": {"content": "SELECT 1 AS n"}}]
+    })
+    with patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)):
+        resp = client.post(
+            "/api/agent/ask",
+            headers=AUTH,
+            json={
+                "question": "group by user?",
+                "history": [
+                    {"question": "how many?", "sql": "SELECT COUNT(*) FROM audit_logs"},
+                ],
+            },
+        )
+    assert resp.status_code == 200
+    content = fake.calls[-1]["json"]["messages"][-1]["content"]
+    assert "how many?" in content
+    assert "group by user?" in content
+
+
+def test_agent_queries_endpoint_requires_auth(client):
+    resp = client.get("/api/agent/queries")
+    assert resp.status_code == 401
+
+
+def test_agent_queries_endpoint_lists_after_ask(client):
+    fake = _FakeResponse(200, {
+        "choices": [{"message": {"content": "SELECT COUNT(*) AS n FROM audit_logs"}}]
+    })
+    with patch("gateway.agent.httpx.AsyncClient.post", new=_fake_post(fake)):
+        resp = client.post(
+            "/api/agent/ask",
+            headers=AUTH,
+            json={"question": "how many?"},
+        )
+    assert resp.status_code == 200
+
+    resp = client.get("/api/agent/queries", headers=AUTH)
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert len(items) == 1
+    assert items[0]["question"] == "how many?"
+    assert items[0]["status"] == "success"
+    assert items[0]["rows_returned"] == 1

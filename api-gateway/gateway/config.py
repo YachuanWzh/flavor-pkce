@@ -57,6 +57,21 @@ FAILOVER_COOLDOWN_SECONDS = int(os.environ.get("FAILOVER_COOLDOWN_SECONDS", "30"
 # /api/logs* endpoints refuse access (fail-closed for audit data).
 AUDIT_API_TOKEN = os.environ.get("AUDIT_API_TOKEN", "")
 
+# Per-model USD prices per 1M tokens used by /api/stats/cost (P1-4).
+# JSON shape: {"model-name": {"prompt": 3.0, "completion": 15.0,
+#                              "cache_read": 0.3, "cache_creation": 3.0}}
+# Any field may be omitted (treated as 0). Models without an entry cost $0.
+MODEL_PRICES: dict = {}
+_raw_prices = os.environ.get("MODEL_PRICES_JSON", "")
+if _raw_prices.strip():
+    try:
+        import json as _json
+        parsed = _json.loads(_raw_prices)
+        if isinstance(parsed, dict):
+            MODEL_PRICES = parsed
+    except ValueError:
+        pass  # malformed config → prices disabled (all costs zero)
+
 # Gateway settings
 HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("GATEWAY_PORT", "8092"))

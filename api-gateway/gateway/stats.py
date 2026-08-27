@@ -138,6 +138,70 @@ def request_stats(
     return rows
 
 
+def _row_cost(row: dict, price: dict) -> float:
+    """USD cost of one aggregated row using the model's per-1M-token prices."""
+    return (
+        row["prompt_tokens"] * price.get("prompt", 0.0)
+        + row["completion_tokens"] * price.get("completion", 0.0)
+        + row["cache_read_tokens"] * price.get("cache_read", 0.0)
+        + row["cache_creation_tokens"] * price.get("cache_creation", 0.0)
+    ) / 1_000_000
+
+
+def cost_usage(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    user: str | None = None,
+    group_by: str | None = None,
+) -> list[dict]:
+    """Estimated USD spend, priced per model via ``config.MODEL_PRICES``.
+
+    Without ``group_by`` the result is a daily cost series; with
+    ``group_by`` (``user`` / ``model`` / ``service``) it is a cost
+    leaderboard. Models without a configured price contribute zero.
+    """
+    where, bindings = _where(start_date, end_date, user)
+    prices = gateway.config.MODEL_PRICES
+
+    if group_by in _GROUP_COLUMNS:
+        group_expr = _GROUP_COLUMNS[group_by]
+        label = group_by
+    else:
+        group_expr = "substr(timestamp, 1, 10)"
+        label = "date"
+
+    sql = f"""
+        SELECT {group_expr} AS {label},
+               model,
+               COUNT(*) AS requests,
+               COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+               COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+               COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+               COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens
+        FROM audit_logs {where}
+        GROUP BY {group_expr}, model
+        ORDER BY {label}
+    """
+    raw = _query(sql, bindings)
+
+    aggregated: dict[str, dict] = {}
+    for row in raw:
+        key = row[label]
+        entry = aggregated.setdefault(key, {"requests": 0, "cost": 0.0})
+        entry["requests"] += row["requests"]
+        entry["cost"] += _row_cost(row, prices.get(row["model"]) or {})
+
+    items = [
+        {label: key, **entry}
+        for key, entry in sorted(
+            aggregated.items(), key=lambda kv: kv[1]["cost"], reverse=True,
+        )
+    ]
+    for item in items:
+        item["cost"] = round(item["cost"], 6)
+    return items
+
+
 def top_models(
     start_date: str | None = None,
     end_date: str | None = None,

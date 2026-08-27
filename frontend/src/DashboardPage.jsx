@@ -34,6 +34,13 @@ function fmtNum(n) {
   return String(n);
 }
 
+function fmtUsd(n) {
+  if (n == null) return "—";
+  if (n === 0) return "$0";
+  if (n < 0.01) return `$${n.toFixed(4)}`;
+  return `$${n.toFixed(2)}`;
+}
+
 function seriesBase() {
   return {
     color: PALETTE,
@@ -59,6 +66,8 @@ export default function DashboardPage() {
   const modelsRef = useRef(null);
   const usersRef = useRef(null);
   const cacheRef = useRef(null);
+  const costRef = useRef(null);
+  const costUsersRef = useRef(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -70,14 +79,16 @@ export default function DashboardPage() {
       const qs = params.toString();
       const suffix = qs ? `?${qs}` : "";
       const extra = qs ? `&${qs}` : "";
-      const [tokens, requests, models, users, cache] = await Promise.all([
+      const [tokens, requests, models, users, cache, cost, costUsers] = await Promise.all([
         fetchStats(`tokens${suffix}`),
         fetchStats(`requests${suffix}`),
         fetchStats(`models?limit=10${extra}`),
         fetchStats(`tokens?group_by=user${extra}`),
         fetchStats(`cache${suffix}`),
+        fetchStats(`cost${suffix}`),
+        fetchStats(`cost?group_by=user${extra}`),
       ]);
-      setData({ tokens, requests, models, users, cache });
+      setData({ tokens, requests, models, users, cache, cost, costUsers });
     } catch (cause) {
       setError(cause.message);
     } finally {
@@ -141,16 +152,35 @@ export default function DashboardPage() {
     series: [{ name: "Cache hit ratio", type: "line", smooth: true, data: data.cache.map((r) => r.hit_ratio) }],
   };
 
+  const costOption = data && {
+    ...seriesBase(),
+    xAxis: { type: "category", data: data.cost.map((r) => r.date) },
+    yAxis: { type: "value", name: "USD" },
+    series: [{ name: "Estimated cost", type: "line", smooth: true, areaStyle: {}, data: data.cost.map((r) => r.cost) }],
+  };
+
+  const costUsersOption = data && {
+    ...seriesBase(),
+    tooltip: { trigger: "item" },
+    grid: { left: 16, right: 60, top: 8, bottom: 8 },
+    xAxis: { type: "value" },
+    yAxis: { type: "category", data: data.costUsers.map((r) => r.user) },
+    series: [{ name: "Estimated cost (USD)", type: "bar", data: data.costUsers.map((r) => r.cost) }],
+  };
+
   useChart(tokensRef, tokenOption);
   useChart(requestsRef, requestOption);
   useChart(latencyRef, latencyOption);
   useChart(modelsRef, modelsOption);
   useChart(usersRef, usersOption);
   useChart(cacheRef, cacheOption);
+  useChart(costRef, costOption);
+  useChart(costUsersRef, costUsersOption);
 
   const totalRequests = data?.requests.reduce((a, r) => a + r.requests, 0) ?? 0;
   const totalErrors = data?.requests.reduce((a, r) => a + r.errors, 0) ?? 0;
   const totalTokens = (data?.tokens.reduce((a, r) => a + r.prompt_tokens + r.completion_tokens, 0)) ?? 0;
+  const totalCost = data?.cost.reduce((a, r) => a + r.cost, 0) ?? 0;
 
   return (
     <main className="admin-shell">
@@ -180,6 +210,7 @@ export default function DashboardPage() {
             <div className="dashboard-card"><span className="label">Total tokens</span><strong>{fmtNum(totalTokens)}</strong><small>prompt + completion</small></div>
             <div className="dashboard-card"><span className="label">Avg latency</span><strong>{data.requests.length ? (data.requests.reduce((a, r) => a + r.avg_duration_ms * r.requests, 0) / totalRequests).toFixed(0) : "—"} ms</strong><small>duration weighted</small></div>
             <div className="dashboard-card"><span className="label">Top model</span><strong>{data.models[0]?.model ?? "—"}</strong><small>{fmtNum(data.models[0]?.total_tokens ?? 0)} tokens</small></div>
+            <div className="dashboard-card"><span className="label">Estimated cost</span><strong>{fmtUsd(totalCost)}</strong><small>{data.costUsers[0] ? `${data.costUsers[0].user} leads at ${fmtUsd(data.costUsers[0].cost)}` : "no priced models"}</small></div>
           </section>
 
           <div className="dashboard-grid">
@@ -189,6 +220,8 @@ export default function DashboardPage() {
             <div className="dashboard-panel"><h2>Cache hit ratio</h2><div ref={cacheRef} className="chart" /></div>
             <div className="dashboard-panel"><h2>Top models</h2><div ref={modelsRef} className="chart" /></div>
             <div className="dashboard-panel"><h2>Top users</h2><div ref={usersRef} className="chart" /></div>
+            <div className="dashboard-panel wide"><h2>Estimated cost over time</h2><div ref={costRef} className="chart" /></div>
+            <div className="dashboard-panel"><h2>Cost by user</h2><div ref={costUsersRef} className="chart" /></div>
           </div>
         </>
       )}

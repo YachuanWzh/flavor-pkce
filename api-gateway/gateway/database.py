@@ -91,20 +91,21 @@ def init_audit_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_audit_user      ON audit_logs("user");
         CREATE INDEX IF NOT EXISTS idx_audit_path      ON audit_logs(path);
 
-        CREATE VIEW IF NOT EXISTS v_audit_daily AS
-        SELECT
-            substr(timestamp, 1, 10) AS date,
-            COUNT(*) AS requests,
-            SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
-            ROUND(AVG(duration_ms), 2) AS avg_duration_ms,
-            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-            COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-            COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
-            COUNT(DISTINCT "user") AS users,
-            COUNT(DISTINCT model) AS models
-        FROM audit_logs
-        GROUP BY date
+        CREATE TABLE IF NOT EXISTS agent_queries (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp      TEXT    NOT NULL,
+            "user"         TEXT    NOT NULL,
+            user_id        TEXT,
+            question       TEXT    NOT NULL,
+            sql            TEXT,
+            error          TEXT,
+            rows_returned  INTEGER,
+            duration_ms    REAL    NOT NULL,
+            prompt_tokens  INTEGER,
+            completion_tokens INTEGER,
+            model          TEXT,
+            status         TEXT    NOT NULL
+        );
     """)
     # Migrate existing databases that lack newer columns.
     for col, col_type in (
@@ -138,6 +139,39 @@ def init_audit_db() -> None:
             conn.execute(f"CREATE INDEX IF NOT EXISTS {idx_name} ON audit_logs({idx_col})")
         except sqlite3.OperationalError:
             pass
+
+    # Views and agent-queries indexes are created after the column migration so
+    # that existing databases (missing newer columns) upgrade cleanly instead
+    # of failing at CREATE VIEW.
+    conn.executescript("""
+        CREATE VIEW IF NOT EXISTS v_audit_daily AS
+        SELECT
+            substr(timestamp, 1, 10) AS date,
+            COUNT(*) AS requests,
+            SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
+            ROUND(AVG(duration_ms), 2) AS avg_duration_ms,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+            COUNT(DISTINCT "user") AS users,
+            COUNT(DISTINCT model) AS models
+        FROM audit_logs
+        GROUP BY date;
+
+        CREATE VIEW IF NOT EXISTS v_audit_agent AS
+        SELECT
+            id, timestamp, "user", method, path, status, duration_ms,
+            upstream_ms, level, prompt_tokens, completion_tokens, model,
+            session_id, cache_read_tokens, cache_creation_tokens,
+            service_name, user_id, client_id
+        FROM audit_logs;
+
+        CREATE INDEX IF NOT EXISTS idx_agent_queries_timestamp
+            ON agent_queries(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_agent_queries_user
+            ON agent_queries("user");
+    """)
 
     conn.commit()
     conn.close()
@@ -349,3 +383,81 @@ def clear_logs() -> int:
     conn.commit()
     conn.close()
     return count
+
+
+# ---------------------------------------------------------------------------
+# Data-agent query audit (P0-1)
+# ---------------------------------------------------------------------------
+
+def insert_agent_query(
+    *,
+    timestamp: str,
+    user: str,
+    question: str,
+    sql: str | None = None,
+    error: str | None = None,
+    rows_returned: int | None = None,
+    duration_ms: float,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    model: str | None = None,
+    status: str,
+    user_id: str | None = None,
+) -> None:
+    """Record one NL→SQL data-agent interaction for auditability.
+
+    Unlike ``audit_logs`` (upstream proxy traffic, hash-chained), this
+    table captures the administrator's own agent usage: the natural-language
+    question, the generated SQL, success/error and upstream token usage.
+    """
+    conn = _connect()
+    conn.execute(
+        """INSERT INTO agent_queries
+           (timestamp, "user", user_id, question, sql, error, rows_returned,
+            duration_ms, prompt_tokens, completion_tokens, model, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (timestamp, user, user_id, question, sql, error, rows_returned,
+         duration_ms, prompt_tokens, completion_tokens, model, status),
+    )
+    conn.commit()
+    conn.close()
+
+
+def query_agent_queries(
+    params: QueryParams,
+) -> PageResult:
+    """Return a paginated page of data-agent query records."""
+    page = max(1, params.get("page", 1))
+    page_size = min(max(1, params.get("page_size", 20)), 200)
+
+    conditions: list[str] = []
+    bindings: list[object] = []
+    if params.get("start_date"):
+        conditions.append("timestamp >= ?")
+        bindings.append(params["start_date"] + "T00:00:00+00:00")
+    if params.get("end_date"):
+        conditions.append("timestamp <= ?")
+        bindings.append(params["end_date"] + "T23:59:59.999999+00:00")
+    if params.get("user"):
+        conditions.append('"user" = ?')
+        bindings.append(params["user"])
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    conn = _connect()
+    count_row = conn.execute(
+        f"SELECT COUNT(*) FROM agent_queries {where}", bindings,
+    ).fetchone()
+    total = count_row[0] if count_row else 0
+
+    offset = (page - 1) * page_size
+    rows = conn.execute(
+        f"SELECT * FROM agent_queries {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+        [*bindings, page_size, offset],
+    ).fetchall()
+    conn.close()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [dict(row) for row in rows],
+    }

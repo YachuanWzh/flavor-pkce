@@ -319,6 +319,80 @@ class TestStatsAPI:
 
 
 # ---------------------------------------------------------------------------
+# Cost estimation (P1-4)
+# ---------------------------------------------------------------------------
+
+MODEL_PRICES_FIXTURE = {
+    "claude-sonnet-4-5": {
+        "prompt": 3.0, "completion": 15.0,
+        "cache_read": 0.3, "cache_creation": 3.0,
+    },
+    "gpt-5": {"prompt": 1.25, "completion": 10.0, "cache_read": 0.125},
+}
+
+
+class TestCostEstimation:
+
+    def test_cost_by_day(self, client, monkeypatch):
+        monkeypatch.setattr(config, "MODEL_PRICES", MODEL_PRICES_FIXTURE)
+        _seed_usage()
+        resp = client.get("/api/stats/cost", headers=AUTH)
+        assert resp.status_code == 200
+        rows = resp.json()["items"]
+        by_date = {r["date"]: r for r in rows}
+        # 08-01: sonnet alice (100p/50c/80cr/10cc) + bob (200p/100c/50cr)
+        day1 = (
+            100 * 3.0 + 50 * 15.0 + 80 * 0.3 + 10 * 3.0
+            + 200 * 3.0 + 100 * 15.0 + 50 * 0.3
+        ) / 1_000_000
+        assert by_date["2026-08-01"]["cost"] == pytest.approx(day1, rel=1e-6)
+        # 08-02: gpt-5 alice (60p/20c); the 502 row has no tokens/model
+        day2 = (60 * 1.25 + 20 * 10.0) / 1_000_000
+        assert by_date["2026-08-02"]["cost"] == pytest.approx(day2, rel=1e-6)
+
+    def test_cost_grouped_by_user(self, client, monkeypatch):
+        monkeypatch.setattr(config, "MODEL_PRICES", MODEL_PRICES_FIXTURE)
+        _seed_usage()
+        resp = client.get("/api/stats/cost?group_by=user", headers=AUTH)
+        assert resp.status_code == 200
+        rows = resp.json()["items"]
+        assert rows[0]["user"] == "bob"  # highest cost first
+        bob = (
+            200 * 3.0 + 100 * 15.0 + 50 * 0.3
+        ) / 1_000_000
+        assert rows[0]["cost"] == pytest.approx(bob, rel=1e-6)
+        alice = next(r for r in rows if r["user"] == "alice")
+        alice_cost = (
+            100 * 3.0 + 50 * 15.0 + 80 * 0.3 + 10 * 3.0
+            + 60 * 1.25 + 20 * 10.0
+        ) / 1_000_000
+        assert alice["cost"] == pytest.approx(alice_cost, rel=1e-6)
+
+    def test_cost_grouped_by_model(self, client, monkeypatch):
+        monkeypatch.setattr(config, "MODEL_PRICES", MODEL_PRICES_FIXTURE)
+        _seed_usage()
+        resp = client.get("/api/stats/cost?group_by=model", headers=AUTH)
+        rows = resp.json()["items"]
+        by_model = {r["model"]: r for r in rows}
+        sonnet_cost = (
+            300 * 3.0 + 150 * 15.0 + 130 * 0.3 + 10 * 3.0
+        ) / 1_000_000
+        assert by_model["claude-sonnet-4-5"]["cost"] == pytest.approx(sonnet_cost, rel=1e-6)
+
+    def test_cost_unknown_model_is_zero(self, client, monkeypatch):
+        """Models without a configured price contribute zero cost."""
+        monkeypatch.setattr(config, "MODEL_PRICES", {})
+        _seed_usage()
+        resp = client.get("/api/stats/cost", headers=AUTH)
+        rows = resp.json()["items"]
+        assert all(r["cost"] == 0.0 for r in rows)
+
+    def test_cost_requires_auth(self, client):
+        resp = client.get("/api/stats/cost")
+        assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: streamed SSE usage reaches the audit log and /api/stats
 # ---------------------------------------------------------------------------
 

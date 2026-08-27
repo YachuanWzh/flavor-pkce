@@ -160,6 +160,9 @@ class TestAuditDatabase:
     def test_existing_database_migrates_client_id_column(self):
         """Existing audit databases should gain client_id without recreation."""
         conn = sqlite3.connect(config.AUDIT_DB_PATH)
+        # A pre-migration database predates the v_audit_agent view (which
+        # references client_id), so drop it to simulate the old schema.
+        conn.execute("DROP VIEW IF EXISTS v_audit_agent")
         conn.execute("DROP INDEX IF EXISTS idx_audit_client_id")
         conn.execute("ALTER TABLE audit_logs DROP COLUMN client_id")
         conn.commit()

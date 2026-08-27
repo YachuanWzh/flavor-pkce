@@ -6,32 +6,48 @@ extracts a single SELECT statement, and executes it through the read-only
 query executor. The upstream call reuses the gateway's own configured
 credential (UPSTREAM_URL / UPSTREAM_API_KEY), so the agent speaks to the
 same providers the gateway trusts.
+
+Every interaction (question, generated SQL, success/error, token usage) is
+recorded in the ``agent_queries`` audit table (P0-1), and the executor runs
+with sensitive request/response body columns blocked.
 """
 
 import json
 import re
+import time
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 
 import httpx
 
 import gateway.config
+from gateway.database import insert_agent_query
 from gateway.query import execute_readonly_query, SCHEMA_DESCRIPTIONS
+
+# Correction rounds after the first generation when the generated SQL fails
+# to execute (P1-3). Total upstream calls per question = 1 + MAX_SQL_RETRIES.
+MAX_SQL_RETRIES = 2
 
 _SYSTEM_PROMPT = """You are a read-only analytics assistant for an LLM API gateway audit log.
 You translate user questions into a single SQLite SELECT statement.
 
+Today's date is {today} (UTC). Relative ranges like "last 7 days" must be
+resolved against this date.
+
 Schema:
 - Table audit_logs: {audit_logs}
+- View v_audit_agent: {v_audit_agent}
 - View v_audit_daily: {v_audit_daily}
 
 Rules:
 - Output ONLY a single SELECT statement, no explanation.
 - Never write to the database; SELECT only.
+- Use the v_audit_agent view for row-level questions (it has no body columns).
 - Prefer the v_audit_daily view for date-aggregated questions.
 - Use double quotes for identifiers (SQLite), e.g. "user".
 - Group daily series as substr(timestamp, 1, 10).
 - You may use aggregate functions: COUNT, SUM, AVG, MIN, MAX.
-""".format(**SCHEMA_DESCRIPTIONS)
+"""
 
 
 def _extract_sql_from_response(text: str | None) -> str | None:
@@ -45,6 +61,68 @@ def _extract_sql_from_response(text: str | None) -> str | None:
     if m:
         return m.group(1).strip().rstrip(";")
     return None
+
+
+def _build_system_prompt() -> str:
+    """Render the system prompt with today's UTC date (P0-2)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    return _SYSTEM_PROMPT.format(today=today, **SCHEMA_DESCRIPTIONS)
+
+
+def _extract_usage(data: dict) -> dict:
+    """Normalise upstream usage to prompt_tokens/completion_tokens.
+
+    OpenAI chat/completions and Anthropic messages use different field
+    names; both are mapped to the same keys used by the audit log.
+    """
+    usage = data.get("usage") or {}
+    if not isinstance(usage, dict):
+        return {}
+    result: dict = {}
+    if "prompt_tokens" in usage:
+        result["prompt_tokens"] = usage["prompt_tokens"]
+    elif "input_tokens" in usage:
+        result["prompt_tokens"] = usage["input_tokens"]
+    if "completion_tokens" in usage:
+        result["completion_tokens"] = usage["completion_tokens"]
+    elif "output_tokens" in usage:
+        result["completion_tokens"] = usage["output_tokens"]
+    return result
+
+
+def _record_query(
+    *,
+    user: str,
+    question: str,
+    sql: str | None,
+    status: str,
+    error: str | None = None,
+    rows_returned: int | None = None,
+    duration_ms: float,
+    usage: dict | None = None,
+    model: str | None = None,
+    user_id: str | None = None,
+) -> None:
+    """Persist one agent interaction to the agent_queries audit table."""
+    usage = usage or {}
+    try:
+        insert_agent_query(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            user=user,
+            user_id=user_id,
+            question=question,
+            sql=sql,
+            error=error,
+            rows_returned=rows_returned,
+            duration_ms=round(duration_ms, 2),
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            model=model,
+            status=status,
+        )
+    except Exception:
+        # Audit persistence must never break the agent response path.
+        pass
 
 
 _ANTHROPIC_SUFFIX = "/anthropic"
@@ -83,13 +161,43 @@ def _routing_config(routing: dict | None) -> dict:
     }
 
 
-async def _call_upstream(question: str, routing: dict | None = None) -> str:
+_MAX_HISTORY_TURNS = 5
+
+
+def _build_user_message(
+    question: str, history: list[dict] | None = None,
+) -> str:
+    """Compose the user message, prefixing recent question/SQL turns so
+    follow-up questions resolve against earlier queries (P2-6)."""
+    if not history:
+        return question
+    lines = ["Previous questions and their generated SQL (context only):"]
+    for turn in history[-_MAX_HISTORY_TURNS:]:
+        q = (turn.get("question") or "").strip()
+        sql = turn.get("sql") or turn.get("error") or ""
+        if q:
+            lines.append(f"Q: {q}\nSQL: {sql}")
+    lines.append(f"\nCurrent question: {question}")
+    return "\n".join(lines)
+
+
+async def _call_upstream(
+    question: str,
+    routing: dict | None = None,
+    *,
+    previous_attempts: list[dict] | None = None,
+    history: list[dict] | None = None,
+) -> tuple[str, dict, str]:
     """Call the signed-in user's (or gateway's) configured upstream LLM.
 
     OpenAI-compatible /chat/completions by default, and the Anthropic
     Messages API when the user's api_type is anthropic or the upstream URL
     points at an Anthropic-compatible base (e.g.
     https://api.deepseek.com/anthropic with x-api-key auth).
+
+    Returns ``(content, usage, model)`` where ``usage`` is normalised to
+    prompt_tokens/completion_tokens. ``previous_attempts`` (P1-3) carries
+    failed SQL + error pairs so the model can correct itself.
     """
     cfg = _routing_config(routing)
     base = cfg["upstream_url"].rstrip("/")
@@ -97,7 +205,16 @@ async def _call_upstream(question: str, routing: dict | None = None) -> str:
     api_key = cfg["upstream_api_key"]
     model = cfg["default_model"]
 
-    if cfg["api_type"].lower() == "anthropic" or base.endswith(_ANTHROPIC_SUFFIX):
+    is_anthropic = (
+        cfg["api_type"].lower() == "anthropic"
+        or base.endswith(_ANTHROPIC_SUFFIX)
+    )
+
+    user_message = _build_user_message(question, history)
+    if previous_attempts:
+        user_message = _build_retry_message(user_message, previous_attempts)
+
+    if is_anthropic:
         headers = {
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
@@ -105,8 +222,8 @@ async def _call_upstream(question: str, routing: dict | None = None) -> str:
         payload = {
             "model": model,
             "max_tokens": 1024,
-            "system": _SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": question}],
+            "system": _build_system_prompt(),
+            "messages": [{"role": "user", "content": user_message}],
         }
         _apply_upstream_auth(headers, api_key, auth_type)
 
@@ -115,20 +232,21 @@ async def _call_upstream(question: str, routing: dict | None = None) -> str:
             resp.raise_for_status()
             data = resp.json()
         try:
-            return "".join(
+            content = "".join(
                 block.get("text", "")
                 for block in data.get("content", [])
                 if block.get("type") == "text"
             )
         except (KeyError, IndexError, TypeError):
             raise ValueError("Upstream LLM returned an unexpected response")
+        return content, _extract_usage(data), model
 
     headers = {"Content-Type": "application/json"}
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": question},
+            {"role": "system", "content": _build_system_prompt()},
+            {"role": "user", "content": user_message},
         ],
         "temperature": 0,
     }
@@ -139,13 +257,33 @@ async def _call_upstream(question: str, routing: dict | None = None) -> str:
         resp.raise_for_status()
         data = resp.json()
     try:
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         raise ValueError("Upstream LLM returned an unexpected response")
+    return content, _extract_usage(data), model
+
+
+def _build_retry_message(
+    question: str, previous_attempts: list[dict],
+) -> str:
+    """Compose the user message for a correction round (P1-3)."""
+    parts = [question]
+    for attempt in previous_attempts:
+        parts.append(
+            f"\n\nThe SQL you generated failed to execute:\n"
+            f"```sql\n{attempt.get('sql', '')}\n```\n"
+            f"Error: {attempt.get('error', '')}\n"
+            f"Please fix the SQL and output ONLY the corrected SELECT statement."
+        )
+    return "\n".join(parts)
 
 
 async def _stream_upstream(
-    question: str, routing: dict | None = None,
+    question: str,
+    routing: dict | None = None,
+    *,
+    previous_attempts: list[dict] | None = None,
+    history: list[dict] | None = None,
 ) -> AsyncIterator[str]:
     """Yield text deltas from Anthropic- or OpenAI-compatible SSE streams."""
     cfg = _routing_config(routing)
@@ -154,6 +292,10 @@ async def _stream_upstream(
     _apply_upstream_auth(
         headers, cfg["upstream_api_key"], cfg["upstream_auth_type"],
     )
+
+    user_message = _build_user_message(question, history)
+    if previous_attempts:
+        user_message = _build_retry_message(user_message, previous_attempts)
 
     is_anthropic = (
         cfg["api_type"].lower() == "anthropic"
@@ -165,8 +307,8 @@ async def _stream_upstream(
         payload = {
             "model": cfg["default_model"],
             "max_tokens": 1024,
-            "system": _SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": question}],
+            "system": _build_system_prompt(),
+            "messages": [{"role": "user", "content": user_message}],
             "stream": True,
         }
     else:
@@ -174,8 +316,8 @@ async def _stream_upstream(
         payload = {
             "model": cfg["default_model"],
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": question},
+                {"role": "system", "content": _build_system_prompt()},
+                {"role": "user", "content": user_message},
             ],
             "temperature": 0,
             "stream": True,
@@ -212,47 +354,154 @@ async def _stream_upstream(
 
 
 async def stream_agent(
-    question: str, routing: dict | None = None, max_rows: int = 100,
+    question: str,
+    routing: dict | None = None,
+    max_rows: int = 100,
+    user: str = "-",
+    user_id: str | None = None,
+    history: list[dict] | None = None,
 ) -> AsyncIterator[dict]:
-    """Stream model deltas, then execute and emit the completed SQL result."""
+    """Stream model deltas, then execute and emit the completed SQL result.
+
+    The interaction is recorded in the ``agent_queries`` audit table and the
+    query executes with sensitive body columns blocked (P0-1).
+    """
     if not question or not question.strip():
         raise ValueError("Question is empty")
 
-    yield {
-        "event": "status",
-        "data": {"stage": "generating", "message": "Generating SQL…"},
-    }
-    parts: list[str] = []
-    async for text in _stream_upstream(question, routing):
-        parts.append(text)
-        yield {"event": "delta", "data": {"text": text}}
+    started = time.perf_counter()
+    attempts: list[dict] = []
+    usage: dict = {}
+    model: str | None = None
+    sql: str | None = None
 
-    sql = _extract_sql_from_response("".join(parts))
-    if sql is None:
-        raise ValueError("Could not extract SQL from the model response")
+    for round_no in range(MAX_SQL_RETRIES + 1):
+        if round_no == 0:
+            yield {
+                "event": "status",
+                "data": {"stage": "generating", "message": "Generating SQL…"},
+            }
+        else:
+            yield {
+                "event": "status",
+                "data": {
+                    "stage": "retrying",
+                    "message": "SQL failed — asking the model to fix it…",
+                },
+            }
+        parts: list[str] = []
+        async for text in _stream_upstream(
+            question, routing,
+            previous_attempts=attempts or None,
+            history=history,
+        ):
+            parts.append(text)
+            if round_no == 0:
+                yield {"event": "delta", "data": {"text": text}}
 
-    yield {"event": "sql", "data": {"sql": sql}}
+        sql = _extract_sql_from_response("".join(parts))
+        if sql is None:
+            _record_query(
+                user=user, user_id=user_id, question=question, sql=None,
+                status="error",
+                error="Could not extract SQL from the model response",
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+            raise ValueError("Could not extract SQL from the model response")
+
+        if round_no == 0:
+            yield {"event": "sql", "data": {"sql": sql}}
+        try:
+            result = execute_readonly_query(
+                sql, max_rows=max_rows, allow_sensitive_columns=False,
+            )
+            break
+        except Exception as exc:
+            attempts.append({"sql": sql, "error": str(exc)})
+            last_error = exc
+    else:
+        _record_query(
+            user=user, user_id=user_id, question=question, sql=sql,
+            status="error", error=str(last_error),
+            duration_ms=(time.perf_counter() - started) * 1000,
+            usage=usage, model=model,
+        )
+        raise last_error
+
+    # After a correction round the client already saw the first SQL; emit the
+    # corrected statement so the visible SQL matches the executed result.
+    if round_no > 0:
+        yield {"event": "sql", "data": {"sql": sql}}
     yield {
         "event": "status",
         "data": {"stage": "executing", "message": "Executing read-only query…"},
     }
-    result = execute_readonly_query(sql, max_rows=max_rows)
+    _record_query(
+        user=user, user_id=user_id, question=question, sql=sql,
+        status="success", rows_returned=len(result["rows"]),
+        duration_ms=(time.perf_counter() - started) * 1000,
+        usage=usage, model=model,
+    )
     yield {"event": "result", "data": {"sql": sql, **result}}
     yield {"event": "done", "data": {}}
 
 
-async def ask_agent(question: str, routing: dict | None = None, max_rows: int = 100) -> dict:
+async def ask_agent(
+    question: str,
+    routing: dict | None = None,
+    max_rows: int = 100,
+    user: str = "-",
+    user_id: str | None = None,
+    history: list[dict] | None = None,
+) -> dict:
     """Translate a question to SQL, execute it read-only, return results.
 
     ``routing`` is the signed-in user's LLM config (upstream_url / api key /
     auth type / default model). When omitted, the gateway-wide UPSTREAM_*
     env config is used (legacy fallback).
+
+    The interaction is recorded in the ``agent_queries`` audit table and the
+    query executes with sensitive body columns blocked (P0-1).
     """
     if not question or not question.strip():
         raise ValueError("Question is empty")
-    content = await _call_upstream(question, routing)
-    sql = _extract_sql_from_response(content)
-    if sql is None:
-        raise ValueError("Could not extract SQL from the model response")
-    result = execute_readonly_query(sql, max_rows=max_rows)
+    started = time.perf_counter()
+    attempts: list[dict] = []
+    for round_no in range(MAX_SQL_RETRIES + 1):
+        content, usage, model = await _call_upstream(
+            question, routing,
+            previous_attempts=attempts or None,
+            history=history,
+        )
+        sql = _extract_sql_from_response(content)
+        if sql is None:
+            _record_query(
+                user=user, user_id=user_id, question=question, sql=None,
+                status="error",
+                error="Could not extract SQL from the model response",
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+            raise ValueError("Could not extract SQL from the model response")
+        try:
+            result = execute_readonly_query(
+                sql, max_rows=max_rows, allow_sensitive_columns=False,
+            )
+            break
+        except Exception as exc:
+            attempts.append({"sql": sql, "error": str(exc)})
+            last_error = exc
+    else:
+        _record_query(
+            user=user, user_id=user_id, question=question, sql=sql,
+            status="error", error=str(last_error),
+            duration_ms=(time.perf_counter() - started) * 1000,
+            usage=usage, model=model,
+        )
+        raise last_error
+    _record_query(
+        user=user, user_id=user_id, question=question, sql=sql,
+        status="success", rows_returned=len(result["rows"]),
+        duration_ms=(time.perf_counter() - started) * 1000,
+        usage=usage, model=model,
+    )
     return {"sql": sql, **result}

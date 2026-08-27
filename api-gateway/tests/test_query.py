@@ -124,3 +124,43 @@ def test_view_queryable_through_executor():
         "SELECT COUNT(*) AS n FROM v_audit_daily"
     )
     assert result["rows"][0]["n"] >= 1
+
+
+def test_agent_view_created_and_queryable():
+    """The agent-safe view (no request/response body columns) must exist and
+    be queryable through the executor."""
+    result = execute_readonly_query("SELECT COUNT(*) AS n FROM v_audit_agent")
+    assert result["rows"][0]["n"] == 2
+
+
+def test_sensitive_body_columns_denied_in_agent_mode():
+    """Regression (P0-1): the data agent must not be able to read prompt/response
+    bodies even though audit_logs itself stays in the allowlist for the
+    administrator /api/query endpoint."""
+    # Default mode keeps body columns readable for administrators.
+    result = execute_readonly_query(
+        "SELECT request_body FROM audit_logs LIMIT 1",
+    )
+    assert "request_body" in result["columns"]
+
+    # Agent mode denies the columns at the engine level.
+    with pytest.raises(ValueError, match="prohibited|not allowed"):
+        execute_readonly_query(
+            "SELECT request_body FROM audit_logs LIMIT 1",
+            allow_sensitive_columns=False,
+        )
+    # SELECT * expands to the sensitive columns and must also be denied.
+    with pytest.raises(ValueError, match="prohibited|not allowed"):
+        execute_readonly_query(
+            "SELECT * FROM audit_logs LIMIT 1",
+            allow_sensitive_columns=False,
+        )
+
+
+def test_agent_mode_denies_bodies_even_with_alias():
+    """Aliasing must not bypass the agent-mode body-column ban."""
+    with pytest.raises(ValueError, match="prohibited|not allowed"):
+        execute_readonly_query(
+            "SELECT request_body AS rb FROM audit_logs LIMIT 1",
+            allow_sensitive_columns=False,
+        )
