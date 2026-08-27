@@ -813,6 +813,30 @@ body::after {
 .chat-hint { color: var(--color-text-muted); font-size: 12px; margin-top: 8px; }
 .chat-chart { width: 100%; margin-top: 8px; border: 1px solid var(--color-card-border); border-radius: 8px; background: rgba(0,0,0,.3); overflow: hidden; }
 
+/* agent usage review page (/agent/review) */
+.agent-nav-link { display: inline-flex; align-items: center; gap: 6px; color: var(--color-text-muted); text-decoration: none; font-size: 13px; font-weight: 600; padding: 8px 14px; border: 1px solid var(--color-card-border); border-radius: 10px; background: rgba(255,255,255,.04); }
+.agent-nav-link:hover { color: var(--color-text); border-color: var(--color-primary); }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.kpi-card { background: var(--color-card); border: 1px solid var(--color-card-border); border-radius: 16px; padding: 16px 18px; backdrop-filter: blur(24px); }
+.kpi-value { font-size: 1.5rem; font-weight: 700; }
+.kpi-label { color: var(--color-text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-top: 4px; }
+.review-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.review-chart-card { background: var(--color-card); border: 1px solid var(--color-card-border); border-radius: 16px; padding: 16px 18px; backdrop-filter: blur(24px); }
+.review-chart-wide { grid-column: 1 / -1; }
+.review-chart-card h3 { font-size: 12px; margin: 0 0 10px; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: .05em; }
+.review-table-wrap { background: var(--color-card); border: 1px solid var(--color-card-border); border-radius: 16px; padding: 16px 18px; backdrop-filter: blur(24px); }
+.review-table-wrap h3 { font-size: 12px; margin: 0 0 10px; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: .05em; }
+.review-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.review-table th, .review-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--color-card-border); vertical-align: top; }
+.review-table th { color: var(--color-text-muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; }
+.review-table tr:last-child td { border-bottom: none; }
+.review-question { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+.badge-success { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+.badge-error { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+.badge-blocked { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+.muted { color: var(--color-text-muted); }
+
 /* full-page variant (/agent) */
 .agent-chat-page { min-height: 560px; height: calc(100vh - 260px); }
 .agent-chat-page .chat-root { height: 100%; }

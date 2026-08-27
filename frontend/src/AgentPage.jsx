@@ -9,6 +9,7 @@ export default function AgentPage() {
           <h1>Ask questions about your audit log.</h1>
           <p>Natural language to read-only SQL with a conversation loop. Dangerous statements are blocked and every SQL execution needs your explicit approval.</p>
         </div>
+        <a className="agent-nav-link" href="/agent/review">Usage review →</a>
       </header>
 
       <section className="agent-chat-page">

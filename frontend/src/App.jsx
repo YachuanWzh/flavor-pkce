@@ -6,6 +6,7 @@ import LlmSettingsPage from "./LlmSettingsPage";
 import AdminLlmSettingsPage from "./AdminLlmSettingsPage";
 import DashboardPage from "./DashboardPage";
 import AgentPage from "./AgentPage";
+import AgentReviewPage from "./AgentReviewPage";
 import "./App.css";
 
 function Home() {
@@ -33,6 +34,7 @@ export default function App() {
         <Route path="/admin/llm-configs" element={<AdminLlmSettingsPage />} />
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/agent" element={<AgentPage />} />
+        <Route path="/agent/review" element={<AgentReviewPage />} />
       </Routes>
     </BrowserRouter>
   );
