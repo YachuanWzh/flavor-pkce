@@ -130,12 +130,16 @@ export default function DashboardPage() {
 
   const tokenOption = data && {
     ...seriesBase(),
-    legend: { data: ["Prompt", "Completion"], top: 0 },
+    legend: { data: ["Prompt", "Completion", "Cache Read", "Cache Create"], top: 0 },
     xAxis: { type: "category", data: days(data.tokens) },
     yAxis: { type: "value" },
+    // Agentic traffic is dominated by cache reads; excluding them made the
+    // chart contradict the Total tokens card (prompt-only bars ~100x smaller).
     series: [
       { name: "Prompt", type: "bar", stack: "t", data: data.tokens.map((r) => r.prompt_tokens) },
       { name: "Completion", type: "bar", stack: "t", data: data.tokens.map((r) => r.completion_tokens) },
+      { name: "Cache Read", type: "bar", stack: "t", data: data.tokens.map((r) => r.cache_read_tokens) },
+      { name: "Cache Create", type: "bar", stack: "t", data: data.tokens.map((r) => r.cache_creation_tokens) },
     ],
   };
 

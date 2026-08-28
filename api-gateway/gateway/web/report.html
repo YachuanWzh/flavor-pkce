@@ -421,6 +421,8 @@ async function loadAll() {
     renderGroupedBars($('chartTokens'), tokens, [
       { key: 'prompt_tokens', color: '#5b8def' },
       { key: 'completion_tokens', color: '#34d399' },
+      { key: 'cache_read_tokens', color: '#a78bfa' },
+      { key: 'cache_creation_tokens', color: '#f87171' },
     ]);
     renderLine($('chartCache'), cache, 'hit_ratio', '#fbbf24', true);
     renderGroupedBars($('chartRequests'), requests, [
