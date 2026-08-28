@@ -50,18 +50,21 @@ SCHEMA_DESCRIPTIONS = {
         "model, session_id, cache_read_tokens, cache_creation_tokens, service_name, "
         "user_id, client_id, request_body, response_body, prev_hash, hash. "
         "NOTE: request_body and response_body are NOT readable by the agent; "
-        "use the v_audit_agent view instead."
+        "use the v_audit_agent view instead. "
+        "Total tokens = prompt_tokens + completion_tokens + cache_read_tokens + cache_creation_tokens."
     ),
     "v_audit_agent": (
         "Audit log without request/response bodies: id, timestamp (ISO8601 UTC), "
         "user, method, path, status, duration_ms, upstream_ms, level, "
         "prompt_tokens, completion_tokens, model, session_id, cache_read_tokens, "
-        "cache_creation_tokens, service_name, user_id, client_id"
+        "cache_creation_tokens, service_name, user_id, client_id. "
+        "Total tokens = prompt_tokens + completion_tokens + cache_read_tokens + cache_creation_tokens."
     ),
     "v_audit_daily": (
         "Daily aggregate view: date (YYYY-MM-DD), requests, errors (status>=400), "
         "avg_duration_ms, prompt_tokens, completion_tokens, cache_read_tokens, "
-        "cache_creation_tokens, users (distinct), models (distinct)"
+        "cache_creation_tokens, users (distinct), models (distinct). "
+        "Total tokens = prompt_tokens + completion_tokens + cache_read_tokens + cache_creation_tokens."
     ),
 }
 

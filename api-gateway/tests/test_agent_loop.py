@@ -246,6 +246,22 @@ def test_system_prompt_instructs_chart_output():
     assert "bar" in _SYSTEM_PROMPT and "line" in _SYSTEM_PROMPT and "pie" in _SYSTEM_PROMPT
 
 
+def test_system_prompts_define_total_tokens_with_cache():
+    """NL2SQL must not invent the old prompt+completion-only "total tokens"
+    definition: agent traffic is dominated by cache reads, so totals have
+    to include both cache columns. Both agent prompts and the schema
+    descriptions shown to the model must state the canonical formula."""
+    from gateway.agent import _SYSTEM_PROMPT as ask_prompt
+    from gateway.agent_loop import _SYSTEM_PROMPT as loop_prompt
+    from gateway.query import SCHEMA_DESCRIPTIONS
+
+    formula = "prompt_tokens + completion_tokens + cache_read_tokens + cache_creation_tokens"
+    for prompt in (ask_prompt, loop_prompt):
+        assert formula in prompt
+    for description in SCHEMA_DESCRIPTIONS.values():
+        assert formula in description
+
+
 # ---- reflection retries ----------------------------------------------------
 
 

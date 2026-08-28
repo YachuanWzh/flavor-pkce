@@ -67,6 +67,7 @@ Rules:
 - Prefer v_audit_daily for date-aggregated questions.
 - Use double quotes for identifiers (SQLite), e.g. "user".
 - Group daily series as substr(timestamp, 1, 10).
+- "Total tokens" always means prompt_tokens + completion_tokens + cache_read_tokens + cache_creation_tokens (provider-reported volume; cache reads dominate agent traffic and must be counted).
 """
 
 
