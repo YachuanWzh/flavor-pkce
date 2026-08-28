@@ -63,6 +63,42 @@ def test_limit_cap_enforced():
     assert result["truncated"] is True
 
 
+def test_with_cte_query_allowed():
+    """WITH ... SELECT (CTEs) must be accepted; CTE names are not real
+    tables and must not hit the allowlist check."""
+    result = execute_readonly_query(
+        "WITH per_user AS (SELECT \"user\", "
+        "SUM(prompt_tokens + completion_tokens) AS total "
+        "FROM v_audit_agent GROUP BY \"user\") "
+        "SELECT * FROM per_user ORDER BY total DESC"
+    )
+    assert result["columns"] == ["user", "total"]
+    assert len(result["rows"]) == 2
+    assert result["rows"][0]["user"] == "alice"
+    assert result["rows"][0]["total"] == 230
+
+
+def test_with_cte_denied_table_inside_body_rejected():
+    """A CTE reading a non-whitelisted table is still denied (authorizer
+    sees the base-table read)."""
+    with pytest.raises(ValueError, match="not allowed"):
+        execute_readonly_query(
+            "WITH c AS (SELECT name FROM sqlite_master) SELECT * FROM c"
+        )
+
+
+def test_with_cte_column_list_and_inner_limit():
+    """`WITH name(cols) AS (...)` is recognised, and an inner LIMIT does
+    not stop the outer row cap from being appended."""
+    result = execute_readonly_query(
+        "WITH ranked(u) AS (SELECT \"user\" FROM v_audit_agent "
+        "GROUP BY \"user\" ORDER BY COUNT(*) DESC LIMIT 1) "
+        "SELECT * FROM ranked"
+    )
+    assert "u" in result["columns"]
+    assert len(result["rows"]) == 1
+
+
 def test_write_statements_rejected():
     with pytest.raises(ValueError, match="Only SELECT"):
         execute_readonly_query("DELETE FROM audit_logs")
@@ -99,6 +135,42 @@ def test_syntax_error_raises_valuable_error():
     # error the API layer can map to a 400, not an unhandled 500.
     with pytest.raises(sqlite3.Error):
         execute_readonly_query("SELECT * FROM")
+
+
+def test_from_subquery_not_mistaken_as_table():
+    """`FROM (SELECT ...)` must not be parsed as a table named "select"."""
+    result = execute_readonly_query(
+        "SELECT * FROM (SELECT \"user\" AS u FROM v_audit_agent)"
+    )
+    assert len(result["rows"]) == 2
+
+
+def test_from_subquery_denied_table_still_rejected():
+    with pytest.raises(ValueError, match="not allowed"):
+        execute_readonly_query(
+            "SELECT * FROM (SELECT name FROM sqlite_master)"
+        )
+
+
+def test_total_tokens_null_semantics_match_dashboard():
+    """Regression: NULL cache columns (rows predating the cache columns or
+    without usage data) must not drop the row's prompt/completion from the
+    total. The dashboard sums each column separately (per-column SUM
+    ignores NULLs); per-row `SUM(a+b+c+d)` yields NULL and silently
+    undercounts."""
+    per_column = execute_readonly_query(
+        "SELECT COALESCE(SUM(prompt_tokens), 0) + COALESCE(SUM(completion_tokens), 0)"
+        " + COALESCE(SUM(cache_read_tokens), 0) + COALESCE(SUM(cache_creation_tokens), 0)"
+        " AS t FROM v_audit_agent"
+    )
+    assert per_column["rows"][0]["t"] == 310  # 230 (alice) + 80 (bob)
+
+    per_row = execute_readonly_query(
+        "SELECT SUM(prompt_tokens + completion_tokens + cache_read_tokens"
+        " + cache_creation_tokens) AS t FROM v_audit_agent"
+    )
+    # Both fixture rows have NULL cache columns → the naive per-row sum is NULL.
+    assert per_row["rows"][0]["t"] is None
 
 
 def test_view_schema_and_aggregates():

@@ -43,13 +43,13 @@ Schema:
 - View v_audit_daily: {v_audit_daily}
 
 Rules:
-- Output ONLY a single SELECT statement, no explanation.
-- Never write to the database; SELECT only.
+- Output ONLY a single SELECT statement (WITH ... SELECT CTEs allowed), no explanation.
+- Never write to the database; read-only SELECT/WITH only.
 - Use the v_audit_agent view for row-level questions (it has no body columns).
 - Prefer the v_audit_daily view for date-aggregated questions.
 - Use double quotes for identifiers (SQLite), e.g. "user".
 - Group daily series as substr(timestamp, 1, 10).
-- "Total tokens" always means prompt_tokens + completion_tokens + cache_read_tokens + cache_creation_tokens (provider-reported volume; cache reads dominate agent traffic and must be counted).
+- "Total tokens" always means prompt + completion + cache_read + cache_creation (provider-reported volume; cache reads dominate agent traffic and must be counted). Aggregate EACH column separately to match the dashboard: COALESCE(SUM(prompt_tokens), 0) + COALESCE(SUM(completion_tokens), 0) + COALESCE(SUM(cache_read_tokens), 0) + COALESCE(SUM(cache_creation_tokens), 0). NEVER write SUM(prompt_tokens + completion_tokens + cache_read_tokens + cache_creation_tokens) — a NULL in any column (older rows have NULL cache columns; non-LLM requests have NULL usage) drops the whole row silently. For per-row values use COALESCE on each column.
 - You may use aggregate functions: COUNT, SUM, AVG, MIN, MAX.
 """
 
@@ -58,10 +58,10 @@ def _extract_sql_from_response(text: str | None) -> str | None:
     """Pull a single SELECT statement out of a model response."""
     if not text:
         return None
-    m = re.search(r"```(?:sql)?\s*(SELECT[\s\S]*?)```", text, re.IGNORECASE)
+    m = re.search(r"```(?:sql)?\s*((?:SELECT|WITH)[\s\S]*?)```", text, re.IGNORECASE)
     if m:
         return m.group(1).strip().rstrip(";")
-    m = re.search(r"(SELECT[\s\S]*?);?\s*$", text, re.IGNORECASE)
+    m = re.search(r"((?:SELECT|WITH)[\s\S]*?);?\s*$", text, re.IGNORECASE)
     if m:
         return m.group(1).strip().rstrip(";")
     return None
@@ -292,7 +292,8 @@ def _build_retry_message(
             f"\n\nThe SQL you generated failed to execute:\n"
             f"```sql\n{attempt.get('sql', '')}\n```\n"
             f"Error: {attempt.get('error', '')}\n"
-            f"Please fix the SQL and output ONLY the corrected SELECT statement."
+            f"Please fix the SQL and output ONLY the corrected read-only "
+            f"SELECT (or WITH ... SELECT) statement."
         )
     return "\n".join(parts)
 
