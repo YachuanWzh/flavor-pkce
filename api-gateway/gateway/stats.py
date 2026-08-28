@@ -73,7 +73,8 @@ def token_usage(
                    COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens
             FROM audit_logs {where}
             GROUP BY {col}
-            ORDER BY prompt_tokens + completion_tokens DESC, {col}
+            ORDER BY prompt_tokens + completion_tokens
+                       + cache_read_tokens + cache_creation_tokens DESC, {col}
         """
     else:
         sql = f"""

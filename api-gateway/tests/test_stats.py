@@ -268,6 +268,22 @@ class TestStatsAPI:
         assert sonnet["cache_read_tokens"] == 130
         assert sonnet["cache_creation_tokens"] == 10
 
+    def test_tokens_grouped_ranked_by_total_including_cache(self, client):
+        """Leaderboard order must follow the displayed total (all four
+        token components), not the old prompt+completion-only sum."""
+        _seed_usage()
+        insert_log(
+            timestamp="2026-08-01T11:00:00+00:00",
+            user="charlie", method="POST", path="/v1/messages",
+            status=200, duration_ms=400.0, upstream_ms=380.0, level="INFO",
+            prompt_tokens=10, completion_tokens=10, model="claude-sonnet-4-5",
+            cache_read_tokens=10000, cache_creation_tokens=0,
+            service_name="anthropic-main",
+        )
+        resp = client.get("/api/stats/tokens?group_by=user", headers=AUTH)
+        rows = resp.json()["items"]
+        assert rows[0]["user"] == "charlie"  # 10020 total, but only 20 p+c
+
     def test_top_models_total_tokens_includes_cache(self, client):
         """total_tokens = prompt + completion + cache_read + cache_creation,
         matching what providers report as actual usage."""
