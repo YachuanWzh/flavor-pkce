@@ -248,6 +248,36 @@ class TestStatsAPI:
         assert by_date["2026-08-02"]["requests"] == 2
         assert by_date["2026-08-02"]["prompt_tokens"] == 60
 
+    def test_tokens_by_day_includes_cache_columns(self, client):
+        """Cache tokens must be visible so Total tokens can use the full
+        provider-reported volume (prompt + completion + cache r/w)."""
+        _seed_usage()
+        resp = client.get("/api/stats/tokens", headers=AUTH)
+        rows = resp.json()["items"]
+        by_date = {r["date"]: r for r in rows}
+        assert by_date["2026-08-01"]["cache_read_tokens"] == 130
+        assert by_date["2026-08-01"]["cache_creation_tokens"] == 10
+        assert by_date["2026-08-02"]["cache_read_tokens"] == 0
+        assert by_date["2026-08-02"]["cache_creation_tokens"] == 0
+
+    def test_tokens_grouped_includes_cache_columns(self, client):
+        _seed_usage()
+        resp = client.get("/api/stats/tokens?group_by=model", headers=AUTH)
+        rows = resp.json()["items"]
+        sonnet = next(r for r in rows if r["model"] == "claude-sonnet-4-5")
+        assert sonnet["cache_read_tokens"] == 130
+        assert sonnet["cache_creation_tokens"] == 10
+
+    def test_top_models_total_tokens_includes_cache(self, client):
+        """total_tokens = prompt + completion + cache_read + cache_creation,
+        matching what providers report as actual usage."""
+        _seed_usage()
+        resp = client.get("/api/stats/models?limit=10", headers=AUTH)
+        rows = resp.json()["items"]
+        assert rows[0]["model"] == "claude-sonnet-4-5"
+        # 300 prompt + 150 completion + 130 cache_read + 10 cache_creation
+        assert rows[0]["total_tokens"] == 590
+
     def test_tokens_grouped_by_user(self, client):
         _seed_usage()
         resp = client.get("/api/stats/tokens?group_by=user", headers=AUTH)
@@ -296,7 +326,8 @@ class TestStatsAPI:
         resp = client.get("/api/stats/models?limit=10", headers=AUTH)
         rows = resp.json()["items"]
         assert rows[0]["model"] == "claude-sonnet-4-5"
-        assert rows[0]["total_tokens"] == 450
+        # prompt 300 + completion 150 + cache_read 130 + cache_creation 10
+        assert rows[0]["total_tokens"] == 590
         assert rows[0]["requests"] == 2
         names = [r["model"] for r in rows]
         assert "gpt-5" in names

@@ -68,7 +68,9 @@ def token_usage(
             SELECT {col} AS {group_by},
                    COUNT(*) AS requests,
                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens
             FROM audit_logs {where}
             GROUP BY {col}
             ORDER BY prompt_tokens + completion_tokens DESC, {col}
@@ -78,7 +80,9 @@ def token_usage(
             SELECT substr(timestamp, 1, 10) AS date,
                    COUNT(*) AS requests,
                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+                   COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                   COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens
             FROM audit_logs {where}
             GROUP BY date
             ORDER BY date
@@ -208,7 +212,7 @@ def top_models(
     user: str | None = None,
     limit: int = 20,
 ) -> list[dict]:
-    """Top models ranked by total (prompt + completion) tokens."""
+    """Top models ranked by total tokens (prompt + completion + cache)."""
     where, bindings = _where(start_date, end_date, user)
     limit = min(max(1, limit), 100)
     sql = f"""
@@ -217,7 +221,9 @@ def top_models(
                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                COALESCE(SUM(prompt_tokens), 0)
-                 + COALESCE(SUM(completion_tokens), 0) AS total_tokens,
+                 + COALESCE(SUM(completion_tokens), 0)
+                 + COALESCE(SUM(cache_read_tokens), 0)
+                 + COALESCE(SUM(cache_creation_tokens), 0) AS total_tokens,
                COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens
         FROM audit_logs {where + ' AND' if where else 'WHERE'} model IS NOT NULL
         GROUP BY model

@@ -378,7 +378,7 @@ function renderUserTable(rows) {
       <td class="num">${r.requests}</td>
       <td class="num">${fmtNum(r.prompt_tokens)}</td>
       <td class="num">${fmtNum(r.completion_tokens)}</td>
-      <td class="num"><strong>${fmtNum(r.prompt_tokens + r.completion_tokens)}</strong></td>
+      <td class="num"><strong>${fmtNum(r.prompt_tokens + r.completion_tokens + r.cache_read_tokens + r.cache_creation_tokens)}</strong></td>
     </tr>
   `).join('') || '<tr><td colspan="5" class="loading">No data</td></tr>';
 }
@@ -408,7 +408,9 @@ async function loadAll() {
 
     $('cardRequests').textContent = fmtNum(totalReqs);
     $('cardErrors').textContent = `${fmtNum(totalErrs)} errors (${totalReqs ? (100 * totalErrs / totalReqs).toFixed(1) : '0'}%)`;
-    $('cardTokens').textContent = fmtNum(totalPrompt + totalCompletion);
+    $('cardTokens').textContent = fmtNum(
+      totalPrompt + totalCompletion + totalCacheRead + totalCacheCreate,
+    );
     $('cardTokensSplit').textContent = `${fmtNum(totalPrompt)} in / ${fmtNum(totalCompletion)} out`;
     const denom = totalPrompt + totalCacheRead + totalCacheCreate;
     $('cardHitRatio').textContent = denom > 0 ? (100 * totalCacheRead / denom).toFixed(1) + '%' : '—';

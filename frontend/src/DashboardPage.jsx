@@ -172,7 +172,7 @@ export default function DashboardPage() {
     grid: { left: 16, right: 60, top: 8, bottom: 8 },
     xAxis: { type: "value" },
     yAxis: { type: "category", data: data.users.map((r) => r.user) },
-    series: [{ name: "Total tokens", type: "bar", data: data.users.map((r) => r.prompt_tokens + r.completion_tokens) }],
+    series: [{ name: "Total tokens", type: "bar", data: data.users.map((r) => r.prompt_tokens + r.completion_tokens + r.cache_read_tokens + r.cache_creation_tokens) }],
   };
 
   const cacheOption = data && {
@@ -209,7 +209,13 @@ export default function DashboardPage() {
 
   const totalRequests = data?.requests.reduce((a, r) => a + r.requests, 0) ?? 0;
   const totalErrors = data?.requests.reduce((a, r) => a + r.errors, 0) ?? 0;
-  const totalTokens = (data?.tokens.reduce((a, r) => a + r.prompt_tokens + r.completion_tokens, 0)) ?? 0;
+  // Match provider-reported volume: prompt + completion + cache read/write
+  // (agentic traffic is dominated by cache reads; prompt-only sums mislead).
+  const totalTokens = (data?.tokens.reduce(
+    (a, r) => a + r.prompt_tokens + r.completion_tokens
+      + r.cache_read_tokens + r.cache_creation_tokens,
+    0,
+  )) ?? 0;
   const totalCost = data?.cost.reduce((a, r) => a + r.cost, 0) ?? 0;
 
   return (
@@ -258,7 +264,7 @@ export default function DashboardPage() {
         <>
           <section className="dashboard-cards">
             <div className="dashboard-card"><span className="label">Requests</span><strong>{fmtNum(totalRequests)}</strong><small>{fmtNum(totalErrors)} errors ({totalRequests ? (100 * totalErrors / totalRequests).toFixed(1) : "0"}%)</small></div>
-            <div className="dashboard-card"><span className="label">Total tokens</span><strong>{fmtNum(totalTokens)}</strong><small>prompt + completion</small></div>
+            <div className="dashboard-card"><span className="label">Total tokens</span><strong>{fmtNum(totalTokens)}</strong><small>prompt + completion + cache</small></div>
             <div className="dashboard-card"><span className="label">Avg latency</span><strong>{data.requests.length ? (data.requests.reduce((a, r) => a + r.avg_duration_ms * r.requests, 0) / totalRequests).toFixed(0) : "—"} ms</strong><small>duration weighted</small></div>
             <div className="dashboard-card"><span className="label">Top model</span><strong>{data.models[0]?.model ?? "—"}</strong><small>{fmtNum(data.models[0]?.total_tokens ?? 0)} tokens</small></div>
             <div className="dashboard-card"><span className="label">Estimated cost</span><strong>{fmtUsd(totalCost)}</strong><small>{data.costUsers[0] ? `${data.costUsers[0].user} leads at ${fmtUsd(data.costUsers[0].cost)}` : "no priced models"}</small></div>
