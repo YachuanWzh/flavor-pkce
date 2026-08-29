@@ -5,6 +5,7 @@ import ConsentPage from "./ConsentPage";
 import LlmSettingsPage from "./LlmSettingsPage";
 import AdminLlmSettingsPage from "./AdminLlmSettingsPage";
 import DashboardPage from "./DashboardPage";
+import ModelPricesPage from "./ModelPricesPage";
 import AgentPage from "./AgentPage";
 import AgentReviewPage from "./AgentReviewPage";
 import AgentKnowledgePage from "./AgentKnowledgePage";
@@ -34,6 +35,7 @@ export default function App() {
         <Route path="/settings/llm" element={<LlmSettingsPage />} />
         <Route path="/admin/llm-configs" element={<AdminLlmSettingsPage />} />
         <Route path="/dashboard" element={<DashboardPage />} />
+        <Route path="/dashboard/prices" element={<ModelPricesPage />} />
         <Route path="/agent" element={<AgentPage />} />
         <Route path="/agent/review" element={<AgentReviewPage />} />
         <Route path="/agent/knowledge" element={<AgentKnowledgePage />} />

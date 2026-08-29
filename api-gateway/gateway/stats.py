@@ -12,7 +12,6 @@ whose ``prompt_tokens`` already include cached tokens the ratio is
 approximate.  Days with no cache data report ``0.0``.
 """
 
-import gateway.config
 from gateway.database import _connect
 
 
@@ -121,12 +120,64 @@ def cache_usage(
     return rows
 
 
+_PERCENTILES = {"p50": 0.50, "p95": 0.95, "p99": 0.99}
+
+
+def _ranked_cte(where: str, partition_by_date: bool) -> str:
+    if partition_by_date:
+        return f"""
+            WITH ranked AS (
+                SELECT substr(timestamp, 1, 10) AS date, duration_ms,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY substr(timestamp, 1, 10)
+                           ORDER BY duration_ms
+                       ) AS rn,
+                       COUNT(*) OVER (
+                           PARTITION BY substr(timestamp, 1, 10)
+                       ) AS part_total
+                FROM audit_logs {where}
+            )
+        """
+    return f"""
+        WITH ranked AS (
+            SELECT duration_ms,
+                   ROW_NUMBER() OVER (ORDER BY duration_ms) AS rn,
+                   COUNT(*) OVER () AS part_total
+            FROM audit_logs {where}
+        )
+    """
+
+
+def _percentile_columns() -> str:
+    """SQL select list computing p50/p95/p99 over the `ranked` CTE.
+
+    ``MIN(CASE WHEN rn >= ceil(part_total*pct) THEN duration_ms END)``
+    returns the row at rank ceil(part_total*pct): within one partition
+    ``part_total`` is constant, so filtering on the rank picks exactly
+    that ordered value. SQLite lacks ceil(); ``x > CAST(x AS INTEGER)``
+    is its 0/1 fraction test.
+    """
+    parts = []
+    for name, pct in _PERCENTILES.items():
+        frac = f"part_total * {pct}"
+        ceil_expr = f"CAST({frac} AS INTEGER) + ({frac} > CAST({frac} AS INTEGER))"
+        parts.append(
+            f"MIN(CASE WHEN rn >= {ceil_expr} THEN duration_ms END) AS {name}"
+        )
+    return ",\n               ".join(parts)
+
+
 def request_stats(
     start_date: str | None = None,
     end_date: str | None = None,
     user: str | None = None,
 ) -> list[dict]:
-    """Daily request volume, error count and average latency."""
+    """Daily request volume, error count, and avg/p50/p95/p99 latency.
+
+    Average alone is misleading for LLM traffic (long agentic streams
+    dominate it), so each day also carries approximate latency
+    percentiles computed with SQLite window functions.
+    """
     where, bindings = _where(start_date, end_date, user)
     sql = f"""
         SELECT substr(timestamp, 1, 10) AS date,
@@ -140,7 +191,74 @@ def request_stats(
     rows = _query(sql, bindings)
     for row in rows:
         row["avg_duration_ms"] = round(row["avg_duration_ms"] or 0.0, 2)
+
+    pct_sql = _ranked_cte(where, partition_by_date=True) + f"""
+        SELECT date,
+               {_percentile_columns()}
+        FROM ranked
+        GROUP BY date
+    """
+    percentiles = {row["date"]: row for row in _query(pct_sql, bindings)}
+    for row in rows:
+        pct = percentiles.get(row["date"]) or {}
+        for name in _PERCENTILES:
+            value = pct.get(name)
+            row[name] = round(value, 2) if value is not None else 0.0
     return rows
+
+
+def latency_summary(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    user: str | None = None,
+) -> dict:
+    """Whole-period latency distribution (one row) for the dashboard card."""
+    where, bindings = _where(start_date, end_date, user)
+    base = _query(
+        f"""SELECT COUNT(*) AS requests,
+                   AVG(duration_ms) AS avg_duration_ms,
+                   MAX(duration_ms) AS max_duration_ms
+            FROM audit_logs {where}""",
+        bindings,
+    )[0]
+    pct_sql = _ranked_cte(where, partition_by_date=False) + f"""
+        SELECT {_percentile_columns()} FROM ranked
+    """
+    pct = _query(pct_sql, bindings)[0] if base["requests"] else {}
+    return {
+        "requests": base["requests"],
+        "avg_duration_ms": round(base["avg_duration_ms"] or 0.0, 2),
+        "max_duration_ms": round(base["max_duration_ms"] or 0.0, 2),
+        "p50": round(pct.get("p50") or 0.0, 2),
+        "p95": round(pct.get("p95") or 0.0, 2),
+        "p99": round(pct.get("p99") or 0.0, 2),
+    }
+
+
+_ERRORS_GROUP_COLUMNS = {
+    "status": "status",
+    "model": 'COALESCE(model, \'(unknown)\')',
+}
+
+
+def errors_breakdown(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    user: str | None = None,
+    group_by: str = "status",
+) -> list[dict]:
+    """Error rows (status >= 400) grouped by status code or model."""
+    column = _ERRORS_GROUP_COLUMNS.get(group_by, _ERRORS_GROUP_COLUMNS["status"])
+    where, bindings = _where(start_date, end_date, user)
+    where_errors = f"{where} AND" if where else "WHERE"
+    sql = f"""
+        SELECT {column} AS key, COUNT(*) AS count
+        FROM audit_logs {where_errors} status >= 400
+        GROUP BY {column}
+        ORDER BY count DESC
+        LIMIT 20
+    """
+    return _query(sql, bindings)
 
 
 def _row_cost(row: dict, price: dict) -> float:
@@ -159,14 +277,15 @@ def cost_usage(
     user: str | None = None,
     group_by: str | None = None,
 ) -> list[dict]:
-    """Estimated USD spend, priced per model via ``config.MODEL_PRICES``.
+    """Estimated USD spend, priced per model via ``prices.effective_prices``.
 
     Without ``group_by`` the result is a daily cost series; with
     ``group_by`` (``user`` / ``model`` / ``service``) it is a cost
     leaderboard. Models without a configured price contribute zero.
     """
     where, bindings = _where(start_date, end_date, user)
-    prices = gateway.config.MODEL_PRICES
+    from gateway.prices import effective_prices
+    prices = effective_prices()
 
     if group_by in _GROUP_COLUMNS:
         group_expr = _GROUP_COLUMNS[group_by]

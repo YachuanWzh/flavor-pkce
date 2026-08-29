@@ -33,7 +33,8 @@ def _minute_bucket(now: float) -> int:
 
 
 def _cost_of(model: str | None, prompt_tokens: int, completion_tokens: int) -> float:
-    prices = gateway.config.MODEL_PRICES.get(model) if model else None
+    from gateway.prices import effective_prices
+    prices = effective_prices().get(model) if model else None
     if not prices:
         return 0.0
     return (

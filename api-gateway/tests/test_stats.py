@@ -440,6 +440,166 @@ class TestCostEstimation:
 
 
 # ---------------------------------------------------------------------------
+# DB-managed model prices (override env, feed cost reports)
+# ---------------------------------------------------------------------------
+
+class TestModelPricesAPI:
+
+    def test_prices_require_auth(self, client):
+        assert client.get("/api/prices").status_code == 401
+        assert client.post("/api/prices", json={"model": "x"}).status_code == 401
+
+    def test_price_crud_cycle(self, client):
+        resp = client.post("/api/prices", headers=AUTH, json={
+            "model": "qwen3.8-flash",
+            "prompt": 0.2, "completion": 0.8,
+            "cache_read": 0.05, "cache_creation": 0.2,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["model"] == "qwen3.8-flash"
+
+        items = client.get("/api/prices", headers=AUTH).json()["items"]
+        assert [r["model"] for r in items] == ["qwen3.8-flash"]
+
+        # Upsert updates in place (no duplicate rows).
+        client.post("/api/prices", headers=AUTH, json={"model": "qwen3.8-flash", "prompt": 0.3})
+        items = client.get("/api/prices", headers=AUTH).json()["items"]
+        assert len(items) == 1
+        assert items[0]["prompt"] == 0.3
+        assert items[0]["completion"] == 0.0  # omitted fields reset to 0
+
+        resp = client.delete("/api/prices/qwen3.8-flash", headers=AUTH)
+        assert resp.status_code == 200
+        assert client.delete("/api/prices/qwen3.8-flash", headers=AUTH).status_code == 404
+
+    def test_negative_price_rejected(self, client):
+        resp = client.post("/api/prices", headers=AUTH, json={"model": "m", "prompt": -1})
+        assert resp.status_code == 400
+
+    def test_catalog_lists_defaults_with_configured_flag(self, client):
+        client.post("/api/prices", headers=AUTH, json={"model": "gpt-4o", "prompt": 2.5})
+        items = client.get("/api/prices/catalog", headers=AUTH).json()["items"]
+        gpt4o = next(i for i in items if i["model"] == "gpt-4o")
+        other = next(i for i in items if i["model"] == "gpt-4o-mini")
+        assert gpt4o["configured"] is True
+        assert other["configured"] is False
+
+    def test_db_price_flows_into_cost_report(self, client, monkeypatch):
+        """Admin-edited prices apply without env config or restart."""
+        monkeypatch.setattr(config, "MODEL_PRICES", {})
+        _seed_usage()
+        client.post("/api/prices", headers=AUTH, json={
+            "model": "claude-sonnet-4-5",
+            "prompt": 3.0, "completion": 15.0, "cache_read": 0.3, "cache_creation": 3.0,
+        })
+        resp = client.get("/api/stats/cost?group_by=model", headers=AUTH)
+        by_model = {r["model"]: r for r in resp.json()["items"]}
+        sonnet_cost = (300 * 3.0 + 150 * 15.0 + 130 * 0.3 + 10 * 3.0) / 1_000_000
+        assert by_model["claude-sonnet-4-5"]["cost"] == pytest.approx(sonnet_cost, rel=1e-6)
+        # Unpriced models still contribute zero.
+        assert by_model["gpt-5"]["cost"] == 0.0
+
+    def test_db_price_overrides_env(self, client, monkeypatch):
+        monkeypatch.setattr(config, "MODEL_PRICES", {"gpt-5": {"prompt": 1.25}})
+        client.post("/api/prices", headers=AUTH, json={"model": "gpt-5", "prompt": 9.9})
+        from gateway.prices import effective_prices
+        assert effective_prices()["gpt-5"]["prompt"] == 9.9
+
+
+# ---------------------------------------------------------------------------
+# Latency percentiles and error breakdown
+# ---------------------------------------------------------------------------
+
+class TestLatencyPercentiles:
+
+    def test_request_stats_include_percentiles(self, client):
+        _seed_usage()  # 08-01: 900/700, 08-02: 300/5000
+        resp = client.get("/api/stats/requests", headers=AUTH)
+        rows = resp.json()["items"]
+        day1 = next(r for r in rows if r["date"] == "2026-08-01")
+        day2 = next(r for r in rows if r["date"] == "2026-08-02")
+        # p50 with 2 rows is the lower of the pair (rank ceil(2*.5)=1).
+        assert day1["p50"] == 700.0
+        assert day1["p95"] == 900.0
+        assert day1["p99"] == 900.0
+        assert day2["p50"] == 300.0
+        assert day2["p95"] == 5000.0
+
+    def test_percentile_distribution_ordering(self, client):
+        for i in range(1, 101):
+            insert_log(
+                timestamp=f"2026-08-03T12:00:00+00:00",
+                user="alice", method="GET", path="/v1/models",
+                status=200, duration_ms=float(i), upstream_ms=None, level="INFO",
+            )
+        resp = client.get("/api/stats/requests", headers=AUTH)
+        row = next(r for r in resp.json()["items"] if r["date"] == "2026-08-03")
+        assert row["p50"] == 50.0
+        assert row["p95"] == 95.0
+        assert row["p99"] == 99.0
+
+    def test_latency_summary_endpoint(self, client):
+        _seed_usage()
+        resp = client.get("/api/stats/latency", headers=AUTH)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["requests"] == 4
+        assert data["avg_duration_ms"] == pytest.approx((900 + 700 + 300 + 5000) / 4, rel=1e-6)
+        assert data["p50"] == 700.0
+        assert data["p95"] == 5000.0
+        assert data["max_duration_ms"] == 5000.0
+
+    def test_latency_summary_empty_range(self, client):
+        resp = client.get(
+            "/api/stats/latency?start_date=2030-01-01", headers=AUTH,
+        )
+        data = resp.json()
+        assert data["requests"] == 0
+        assert data["p95"] == 0.0
+
+    def test_latency_requires_auth(self, client):
+        assert client.get("/api/stats/latency").status_code == 401
+
+    def test_date_filter_applies(self, client):
+        _seed_usage()
+        resp = client.get(
+            "/api/stats/latency?start_date=2026-08-02&end_date=2026-08-02",
+            headers=AUTH,
+        )
+        data = resp.json()
+        assert data["requests"] == 2
+        assert data["p50"] == 300.0
+
+
+class TestErrorsBreakdown:
+
+    def test_errors_by_status(self, client):
+        _seed_usage()  # one 502
+        insert_log(
+            timestamp="2026-08-02T11:00:00+00:00",
+            user="bob", method="POST", path="/v1/messages",
+            status=429, duration_ms=10.0, upstream_ms=None, level="WARN",
+        )
+        resp = client.get("/api/stats/errors", headers=AUTH)
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        assert {i["key"]: i["count"] for i in items} == {502: 1, 429: 1}
+
+    def test_errors_by_model(self, client):
+        _seed_usage()  # 502 row has no model
+        resp = client.get("/api/stats/errors?group_by=model", headers=AUTH)
+        items = resp.json()["items"]
+        assert items == [{"key": "(unknown)", "count": 1}]
+
+    def test_invalid_group_by_rejected(self, client):
+        resp = client.get("/api/stats/errors?group_by=password", headers=AUTH)
+        assert resp.status_code == 422
+
+    def test_errors_requires_auth(self, client):
+        assert client.get("/api/stats/errors").status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: streamed SSE usage reaches the audit log and /api/stats
 # ---------------------------------------------------------------------------
 

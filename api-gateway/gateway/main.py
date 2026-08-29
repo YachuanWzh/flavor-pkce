@@ -125,7 +125,7 @@ async def _is_jti_revoked(jti: str) -> bool:
 # Path prefixes that the observability middleware should NOT audit-log.
 _AUDIT_SKIP_PREFIXES = (
     "/metrics", "/api/logs", "/api/stats", "/api/query", "/api/agent",
-    "/api/alerts",
+    "/api/alerts", "/api/prices",
     "/health", "/report",
 )
 
@@ -417,6 +417,33 @@ def api_stats_requests(
     _require_audit_token(request)
     import gateway.stats as stats
     return {"items": stats.request_stats(start_date, end_date, user)}
+
+
+@app.get("/api/stats/latency")
+def api_stats_latency(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+):
+    """Whole-period latency distribution (avg/p50/p95/p99) for the cards."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return stats.latency_summary(start_date, end_date, user)
+
+
+@app.get("/api/stats/errors")
+def api_stats_errors(
+    request: Request,
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    user: str | None = Query(None),
+    group_by: str = Query("status", pattern="^(status|model)$"),
+):
+    """Error rows grouped by status code or model for the breakdown chart."""
+    _require_audit_token(request)
+    import gateway.stats as stats
+    return {"items": stats.errors_breakdown(start_date, end_date, user, group_by)}
 
 
 @app.get("/api/stats/models")
@@ -779,6 +806,59 @@ def api_alerts_ack(request: Request, alert_id: int):
     if not ack_alert(alert_id):
         raise HTTPException(status_code=404, detail="Alert not found")
     return {"acked": True}
+
+
+# ---------------------------------------------------------------------------
+# Model prices (dashboard cost estimation) — admin CRUD + default catalog
+# ---------------------------------------------------------------------------
+
+class ModelPriceRequest(BaseModel):
+    model: str
+    prompt: float = 0.0
+    completion: float = 0.0
+    cache_read: float = 0.0
+    cache_creation: float = 0.0
+
+
+@app.get("/api/prices")
+def api_prices_list(request: Request):
+    """List admin-configured per-model USD prices (per 1M tokens)."""
+    _require_audit_token(request)
+    from gateway.prices import list_model_prices
+    return {"items": list_model_prices()}
+
+
+@app.get("/api/prices/catalog")
+def api_prices_catalog(request: Request):
+    """Public default price catalog with a per-entry `configured` flag."""
+    _require_audit_token(request)
+    from gateway.prices import catalog_entries
+    return {"items": catalog_entries()}
+
+
+@app.post("/api/prices")
+def api_prices_upsert(request: Request, body: ModelPriceRequest):
+    """Create or update one model price; takes effect without a restart."""
+    _require_audit_token(request)
+    from gateway.prices import upsert_model_price
+    try:
+        return upsert_model_price(
+            body.model,
+            prompt=body.prompt, completion=body.completion,
+            cache_read=body.cache_read, cache_creation=body.cache_creation,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/prices/{model}")
+def api_prices_delete(request: Request, model: str):
+    """Delete one model price (the model then costs $0 again)."""
+    _require_audit_token(request)
+    from gateway.prices import delete_model_price
+    if not delete_model_price(model):
+        raise HTTPException(status_code=404, detail="Model price not found")
+    return {"deleted": True}
 
 
 @app.post("/api/agent/ask")

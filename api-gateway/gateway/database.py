@@ -154,6 +154,15 @@ def init_audit_db() -> None:
             PRIMARY KEY ("user", day)
         );
 
+        CREATE TABLE IF NOT EXISTS model_prices (
+            model          TEXT    PRIMARY KEY,
+            prompt         REAL    NOT NULL DEFAULT 0,
+            completion     REAL    NOT NULL DEFAULT 0,
+            cache_read     REAL    NOT NULL DEFAULT 0,
+            cache_creation REAL    NOT NULL DEFAULT 0,
+            updated_at     TEXT    NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS gateway_alerts (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             day        TEXT    NOT NULL,

@@ -107,7 +107,7 @@
 <div class="container">
   <header>
     <h1>Usage Report</h1>
-    <a class="nav-link" href="../audit">← Audit Logs</a>
+    <a class="nav-link" href="./audit">← Audit Logs</a>
   </header>
 
   <div class="filters">
@@ -223,8 +223,9 @@
 
 <script>
 // Relative paths: work both at /report (dev) and behind a path prefix
-// in production (browser resolves against the current page directory).
-const STATS = '../api/stats';
+// in production. './api/stats' resolves against the page's directory
+// (/gw/ -> /gw/api/stats); '../' would escape to the SPA root instead.
+const STATS = './api/stats';
 
 function $(id) { return document.getElementById(id); }
 function fmtNum(n) {

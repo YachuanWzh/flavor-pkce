@@ -205,7 +205,7 @@
     <h1>Gateway Audit Logs</h1>
     <div style="display:flex;gap:1rem;align-items:center">
       <span class="badge" id="autoRefreshBadge">Auto-refresh: off</span>
-      <a class="nav-link" href="../report">Usage Report →</a>
+      <a class="nav-link" href="./report">Usage Report →</a>
     </div>
   </header>
 
@@ -282,9 +282,12 @@
 </div>
 
 <script>
-// Relative path: works both at /audit (dev) and /gw/audit (prod SSO),
-// because the browser resolves it against the current page's directory.
-const API = '../api/logs';
+// Relative path: works both at /audit (dev) and /gw/audit (prod SSO).
+// The page URL has no trailing slash, so the base directory is the one
+// containing the page (e.g. /gw/); './api/logs' resolves to /api/logs in
+// dev and /gw/api/logs behind the gateway prefix — '../' would escape to
+// the root and hit the SPA instead.
+const API = './api/logs';
 let autoRefresh = false;
 let refreshTimer = null;
 
@@ -576,6 +579,17 @@ $('clearBtn').addEventListener('click', async () => {
 document.querySelectorAll('.filter-group input').forEach(el => {
   el.addEventListener('keydown', (e) => { if (e.key === 'Enter') fetchLogs(1); });
 });
+
+// Prefill filters from the URL so the dashboard can deep-link a day/user
+// (e.g. /gw/audit?start_date=2026-08-28&end_date=2026-08-28&user=alice).
+const urlParams = new URLSearchParams(location.search);
+for (const [param, input] of [
+  ['start_date', 'startDate'], ['end_date', 'endDate'],
+  ['user', 'userFilter'], ['keyword', 'keyword'],
+]) {
+  const value = urlParams.get(param);
+  if (value) $(input).value = value;
+}
 
 // Initial load
 fetchLogs(1);
