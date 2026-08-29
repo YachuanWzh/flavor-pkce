@@ -51,3 +51,7 @@ api-gateway/smoke_gw.log
 .worktrees/
 # superharness ralph runtime state (per-task tracking + retry)
 .flavor/superharness/ralph/
+# superharness onboarding analysis cache (regenerable, never committed)
+.flavor/superharness/onboarding/
+docs/onboarding
+ONBOARDING.md
