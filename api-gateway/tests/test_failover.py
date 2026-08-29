@@ -1,4 +1,4 @@
-"""Gateway intelligent routing / failover (hybrid strategy).
+"""Gateway intelligent routing / failover (silent failover by default).
 
 The upstream HTTP layer is replaced with an in-process fake so tests control
 exactly which candidate route succeeds or fails.  ``verify_jwt``,
@@ -140,6 +140,10 @@ def isolated(monkeypatch):
     )
     monkeypatch.setattr(config, "FAILOVER_COOLDOWN_SECONDS", 30, raising=False)
     monkeypatch.setattr(config, "ROUTING_CACHE_TTL_SECONDS", 0, raising=False)
+    # Silent failover is the default: no user confirmation, never a 409.
+    monkeypatch.setattr(
+        config, "FAILOVER_REQUIRE_CONSENT", False, raising=False,
+    )
 
     monkeypatch.setattr(gm, "httpx", FakeHttpx)
     monkeypatch.setattr(gm, "verify_jwt", lambda token: make_jwt_payload())
@@ -228,7 +232,42 @@ def test_silent_failover_streams_sse_from_fallback(client, monkeypatch):
     assert b"event: message" in resp.content
 
 
+def test_incompatible_fallback_switches_silently(client, monkeypatch):
+    """Silent failover (default): a cross-protocol backup is used as-is."""
+    routing = primary_route()
+    routing["fallback"] = fallback_route(api_type="openai")
+    _set_routing(monkeypatch, routing)
+    FakeAsyncClient.behavior = {
+        "primary.test": FakeResponse(503, b'{"error":"down"}'),
+        "fallback.test": FakeResponse(200, b'{"id":"x"}'),
+    }
+    resp = client.post("/v1/chat", json=chat_body())
+    assert resp.status_code == 200
+    assert resp.headers.get("X-Gateway-Route") == "Backup Route"
+    assert any(
+        "fallback.test" in u for u in FakeAsyncClient.requested_urls
+    )
+
+
+def test_incompatible_fallback_model_switches_silently(client, monkeypatch):
+    """Silent failover (default): a backup missing the model is used as-is."""
+    routing = primary_route()
+    routing["fallback"] = fallback_route(models=["other-model-only"])
+    _set_routing(monkeypatch, routing)
+    FakeAsyncClient.behavior = {
+        "primary.test": FakeResponse(503, b'{"error":"down"}'),
+        "fallback.test": FakeResponse(200, b'{"id":"x"}'),
+    }
+    resp = client.post("/v1/chat", json=chat_body())
+    assert resp.status_code == 200
+    assert resp.headers.get("X-Gateway-Route") == "Backup Route"
+
+
 def test_incompatible_fallback_api_type_returns_409(client, monkeypatch):
+    """Consent mode: a cross-protocol backup requires user confirmation."""
+    monkeypatch.setattr(
+        config, "FAILOVER_REQUIRE_CONSENT", True, raising=False,
+    )
     routing = primary_route()
     routing["fallback"] = fallback_route(api_type="openai")
     _set_routing(monkeypatch, routing)
@@ -248,6 +287,10 @@ def test_incompatible_fallback_api_type_returns_409(client, monkeypatch):
 
 
 def test_incompatible_fallback_model_returns_409(client, monkeypatch):
+    """Consent mode: a backup missing the model requires user confirmation."""
+    monkeypatch.setattr(
+        config, "FAILOVER_REQUIRE_CONSENT", True, raising=False,
+    )
     routing = primary_route()
     routing["fallback"] = fallback_route(models=["other-model-only"])
     _set_routing(monkeypatch, routing)
@@ -285,6 +328,9 @@ def test_no_fallback_single_route_failure_returns_502(client, monkeypatch):
 
 def test_preferred_route_header_overrides_incompatibility(client, monkeypatch):
     """Explicit user consent via X-Gateway-Preferred-Route allows the switch."""
+    monkeypatch.setattr(
+        config, "FAILOVER_REQUIRE_CONSENT", True, raising=False,
+    )
     routing = primary_route()
     routing["fallback"] = fallback_route(api_type="openai")
     _set_routing(monkeypatch, routing)

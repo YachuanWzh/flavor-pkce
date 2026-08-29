@@ -1219,11 +1219,14 @@ async def proxy(request: Request, path: str):
     # route; once a response (including an SSE stream) is handed back, no
     # retry is possible.
     #
-    # Hybrid switch policy:
-    # - silent switch when the next route speaks the same api_type and serves
-    #   the requested model (response carries X-Gateway-Route);
-    # - otherwise a 409 ``route_switched`` error tells the client to ask the
-    #   user whether to continue; explicit consent comes back as the
+    # Switch policy (gateway.config.FAILOVER_REQUIRE_CONSENT):
+    # - silent failover (default): when the primary route fails the gateway
+    #   switches to the backup route transparently even if it is not drop-in
+    #   compatible (response merely carries X-Gateway-Route); the client is
+    #   never asked to confirm;
+    # - consent flow (FAILOVER_REQUIRE_CONSENT=true): a non-compatible backup
+    #   triggers a 409 ``route_switched`` error asking the client to confirm
+    #   with the user; explicit consent comes back as the
     #   X-Gateway-Preferred-Route header naming the target service.
     for index, route in enumerate(candidates):
         service_name = str(route.get("service_name", ""))
@@ -1237,9 +1240,17 @@ async def proxy(request: Request, path: str):
             and _route_cooldowns.get(cooldown_key, 0) > time.monotonic()
         ):
             continue
-        # Compatibility gate for every non-primary candidate.
-        if index > 0 and not _route_compatible(
-            primary, route, request.state.model,
+        # Compatibility gate for every non-primary candidate.  With silent
+        # failover (the default) the gate is bypassed: the switch happens
+        # without user confirmation even for non drop-in backups.  In consent
+        # mode a non-compatible backup returns 409 unless the client already
+        # consented via X-Gateway-Preferred-Route.
+        if (
+            index > 0
+            and gateway.config.FAILOVER_REQUIRE_CONSENT
+            and not _route_compatible(
+                primary, route, request.state.model,
+            )
         ):
             if preferred != service_name:
                 return JSONResponse(
@@ -1422,8 +1433,9 @@ def _candidate_routes(routing: dict) -> list[dict]:
 def _route_compatible(primary: dict, candidate: dict, model: str | None) -> bool:
     """Silent-switch gate: same protocol and the model must be servable.
 
-    The hybrid strategy only switches transparently when the backup route is
-    drop-in compatible with the request; otherwise the client is asked.
+    Only consulted in consent mode (FAILOVER_REQUIRE_CONSENT=true): the
+    switch is transparent only when the backup route is drop-in compatible
+    with the request; otherwise the client is asked.
     """
     if candidate.get("api_type") != primary.get("api_type"):
         return False

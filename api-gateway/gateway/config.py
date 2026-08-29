@@ -53,6 +53,17 @@ REVOCATION_CACHE_TTL_SECONDS = int(os.environ.get("REVOCATION_CACHE_TTL_SECONDS"
 # this many seconds (circuit-breaker cooldown). 0 disables cooldowns.
 FAILOVER_COOLDOWN_SECONDS = int(os.environ.get("FAILOVER_COOLDOWN_SECONDS", "30"))
 
+# Failover switch policy. False (default): silent failover — when the primary
+# route fails the gateway always switches to the backup route transparently,
+# even if it is not drop-in compatible (different api_type or missing model);
+# no client confirmation is ever required. True: restore the consent flow —
+# a non-compatible backup triggers 409 route_switched and the switch only
+# proceeds with an explicit X-Gateway-Preferred-Route header.
+FAILOVER_REQUIRE_CONSENT = (
+    os.environ.get("FAILOVER_REQUIRE_CONSENT", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
 # Per-user quota enforcement on the proxy (0 = limit disabled).
 # Requests per user per fixed one-minute window.
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "0"))
