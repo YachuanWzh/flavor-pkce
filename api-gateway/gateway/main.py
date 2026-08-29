@@ -1293,6 +1293,14 @@ async def proxy(request: Request, path: str):
 
         request.state.service_name = service_name
 
+        # Failover to a backup profile switches base URL and API key above;
+        # the model lives inside the client body, so rewrite it here too:
+        # a model the backup cannot serve is replaced by that profile's
+        # main model (default_model). Primary requests pass through untouched.
+        if index > 0:
+            body = _rewrite_body_for_route(body, route, request.state.model)
+            request.state.model = _extract_model(body)
+
         client = httpx.AsyncClient(timeout=300.0)
         took_sse = False
         try:
@@ -1443,6 +1451,36 @@ def _route_compatible(primary: dict, candidate: dict, model: str | None) -> bool
     if not models:
         return True
     return model is None or model in models
+
+
+def _rewrite_body_for_route(
+    body: bytes, route: dict, model: str | None,
+) -> bytes:
+    """Replace the body's ``model`` with the route's main model when the
+    route cannot serve the requested one.
+
+    Used only for failover (non-primary) candidates, so a backup profile
+    with its own base URL / key / models actually receives a model it
+    hosts.  The body is returned unchanged when:
+
+    - the route serves the requested model (or lists no models at all);
+    - the route has no ``default_model`` (legacy profiles keep the old
+      passthrough behaviour);
+    - the body is not a JSON object whose ``model`` matches ``model``
+      (e.g. non-JSON payloads are never rewritten).
+    """
+    models = route.get("models") or []
+    default_model = str(route.get("default_model") or "")
+    if not models or not default_model or model is None or model in models:
+        return body
+    try:
+        data = _json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(data, dict) or data.get("model") != model:
+        return body
+    data["model"] = default_model
+    return _json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
 def _header_safe_route_name(name: str) -> str:

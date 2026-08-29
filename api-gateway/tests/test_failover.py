@@ -49,6 +49,7 @@ class FakeAsyncClient:
 
     behavior = {}
     requested_urls: list[str] = []
+    requested_bodies: list[tuple[str, bytes]] = []
 
     def __init__(self, *args, **kwargs):
         pass
@@ -58,6 +59,7 @@ class FakeAsyncClient:
 
     async def send(self, request, stream=True):
         FakeAsyncClient.requested_urls.append(request.url)
+        FakeAsyncClient.requested_bodies.append((request.url, request.content))
         for key, value in FakeAsyncClient.behavior.items():
             if key in request.url:
                 if isinstance(value, Exception):
@@ -132,6 +134,7 @@ def fallback_route(**overrides):
 def isolated(monkeypatch):
     FakeAsyncClient.behavior = {}
     FakeAsyncClient.requested_urls = []
+    FakeAsyncClient.requested_bodies = []
     gm._route_cooldowns.clear()
 
     # Bypass SSRF resolution for the fake hosts.
@@ -415,3 +418,71 @@ def test_recovered_route_is_used_again_after_cooldown_expires(client, monkeypatc
         for (_, svc), deadline in gm._route_cooldowns.items()
         if svc == "Primary DeepSeek"
     )
+
+
+def _forwarded_model(url_substring: str) -> str | None:
+    """Model name in the body forwarded to the route matching the URL."""
+    import json as _json
+    for url, content in FakeAsyncClient.requested_bodies:
+        if url_substring in url:
+            return _json.loads(content).get("model")
+    raise AssertionError(f"no request seen for {url_substring!r}")
+
+
+def test_failover_rewrites_model_to_fallback_default_model(client, monkeypatch):
+    """qwen3.8-flash on a dead Qwen primary must be rewritten to the
+    fallback profile's main model before hitting the DeepSeek backup."""
+    routing = primary_route(
+        default_model="qwen3.8-flash", models=["qwen3.8-flash"],
+    )
+    routing["fallback"] = fallback_route(
+        default_model="deepseek-v4-flash", models=["deepseek-v4-flash"],
+    )
+    _set_routing(monkeypatch, routing)
+    FakeAsyncClient.behavior = {
+        "primary.test": FakeResponse(503, b'{"error":"down"}'),
+        "fallback.test": FakeResponse(200, b'{"id":"from-backup"}'),
+    }
+    resp = client.post("/v1/chat", json=chat_body(model="qwen3.8-flash"))
+    assert resp.status_code == 200
+    assert resp.headers.get("X-Gateway-Route") == "Backup Route"
+    # Primary got the original model; backup got the fallback's main model.
+    assert _forwarded_model("primary.test") == "qwen3.8-flash"
+    assert _forwarded_model("fallback.test") == "deepseek-v4-flash"
+
+
+def test_failover_keeps_model_servable_by_fallback(client, monkeypatch):
+    """A model the backup can already serve must be forwarded unchanged."""
+    routing = primary_route(models=["qwen3.8-flash", "deepseek-v4-flash"])
+    routing["fallback"] = fallback_route(
+        default_model="deepseek-v4-flash", models=["deepseek-v4-flash"],
+    )
+    _set_routing(monkeypatch, routing)
+    FakeAsyncClient.behavior = {
+        "primary.test": FakeResponse(503, b'{"error":"down"}'),
+        "fallback.test": FakeResponse(200, b'{"id":"from-backup"}'),
+    }
+    resp = client.post("/v1/chat", json=chat_body(model="deepseek-v4-flash"))
+    assert resp.status_code == 200
+    assert resp.headers.get("X-Gateway-Route") == "Backup Route"
+    assert _forwarded_model("fallback.test") == "deepseek-v4-flash"
+
+
+def test_failover_without_default_model_forwards_body_unchanged(
+    client, monkeypatch,
+):
+    """Legacy fallback profiles with no main model keep the old passthrough."""
+    routing = primary_route(
+        default_model="qwen3.8-flash", models=["qwen3.8-flash"],
+    )
+    routing["fallback"] = fallback_route(
+        default_model="", models=["deepseek-v4-flash"],
+    )
+    _set_routing(monkeypatch, routing)
+    FakeAsyncClient.behavior = {
+        "primary.test": FakeResponse(503, b'{"error":"down"}'),
+        "fallback.test": FakeResponse(200, b'{"id":"from-backup"}'),
+    }
+    resp = client.post("/v1/chat", json=chat_body(model="qwen3.8-flash"))
+    assert resp.status_code == 200
+    assert _forwarded_model("fallback.test") == "qwen3.8-flash"
