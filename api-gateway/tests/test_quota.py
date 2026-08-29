@@ -171,3 +171,76 @@ def test_usage_is_bucketed_per_utc_day():
     today = get_day_usage("alice", day="2026-08-27")
     assert today["prompt_tokens"] == 7
     assert today["completion_tokens"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Cache tokens in the cost / budget accounting (improvement 3)
+# ---------------------------------------------------------------------------
+
+def test_record_usage_prices_cache_tokens():
+    """Cost must follow the dashboard convention: each of the four token
+    columns priced with its own rate (stats._row_cost parity)."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(config, "MODEL_PRICES", {
+            "gpt-x": {"prompt": 3.0, "completion": 15.0,
+                      "cache_read": 0.3, "cache_creation": 3.75},
+        }, raising=False)
+        record_usage("alice", prompt_tokens=1000, completion_tokens=500,
+                     model="gpt-x", cache_read_tokens=20000,
+                     cache_creation_tokens=2000)
+        usage = get_day_usage("alice")
+        assert usage["cache_read_tokens"] == 20000
+        assert usage["cache_creation_tokens"] == 2000
+        expected = (1000 * 3 + 500 * 15 + 20000 * 0.3 + 2000 * 3.75) / 1_000_000
+        assert usage["cost"] == pytest.approx(expected)
+
+
+def test_token_budget_counts_cache_tokens():
+    """Daily token budget uses the canonical total (prompt + completion +
+    cache read + cache creation), matching the dashboard cards."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(config, "DAILY_TOKEN_BUDGET", 1000, raising=False)
+        record_usage("alice", prompt_tokens=100, completion_tokens=100,
+                     cache_read_tokens=900)
+        ok, err = check("alice")
+        assert not ok
+        assert err["error"] == "token_budget_exceeded"
+        assert err["used"] == 1100
+
+
+def test_record_usage_only_cache_tokens_is_counted():
+    record_usage("alice", prompt_tokens=0, completion_tokens=0,
+                 cache_read_tokens=5000)
+    assert get_day_usage("alice")["cache_read_tokens"] == 5000
+
+
+def test_legacy_quota_rows_get_cache_columns_on_init():
+    """An existing quota_usage table without the cache columns is migrated
+    by init_audit_db (ALTER loop), and accounting keeps working."""
+    import sqlite3
+    import gateway.quota as quota
+    conn = sqlite3.connect(config.AUDIT_DB_PATH)
+    conn.execute("DROP TABLE quota_usage")
+    conn.execute("""
+        CREATE TABLE quota_usage (
+            "user"            TEXT    NOT NULL,
+            day               TEXT    NOT NULL,
+            prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cost              REAL    NOT NULL DEFAULT 0.0,
+            minute_bucket     INTEGER NOT NULL DEFAULT 0,
+            minute_hits       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY ("user", day)
+        )""")
+    conn.execute(
+        "INSERT INTO quota_usage VALUES ('alice', ?, 10, 5, 0.0, 0, 0)",
+        (quota._utc_day(),),
+    )
+    conn.commit()
+    conn.close()
+    init_audit_db()  # must add the missing columns, not crash
+    record_usage("alice", prompt_tokens=1, completion_tokens=1,
+                 cache_read_tokens=2)
+    usage = get_day_usage("alice")
+    assert usage["prompt_tokens"] == 11  # old row preserved
+    assert usage["cache_read_tokens"] == 2

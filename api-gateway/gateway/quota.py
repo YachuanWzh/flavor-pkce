@@ -3,9 +3,10 @@
 Three independent limits, each disabled when configured to 0:
 
 - ``RATE_LIMIT_RPM``          — requests per user per fixed one-minute window.
-- ``DAILY_TOKEN_BUDGET``      — prompt+completion tokens per UTC day.
+- ``DAILY_TOKEN_BUDGET``      — total tokens per UTC day (prompt +
+  completion + cache read + cache creation, the dashboard convention).
 - ``DAILY_COST_BUDGET_USD``   — estimated USD spend per UTC day, priced with
-  ``MODEL_PRICES`` (same table the /api/stats/cost report uses).
+  ``MODEL_PRICES`` (same table and per-field pricing as /api/stats/cost).
 
 Daily usage is persisted in the audit SQLite (``quota_usage``) so budgets
 survive restarts.  The one-minute request counter deliberately shares the
@@ -32,7 +33,15 @@ def _minute_bucket(now: float) -> int:
     return int(now // 60)
 
 
-def _cost_of(model: str | None, prompt_tokens: int, completion_tokens: int) -> float:
+def _cost_of(
+    model: str | None,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+) -> float:
+    """USD cost, priced exactly like the dashboard (stats._row_cost):
+    every token column carries its own per-1M rate."""
     from gateway.prices import effective_prices
     prices = effective_prices().get(model) if model else None
     if not prices:
@@ -40,6 +49,8 @@ def _cost_of(model: str | None, prompt_tokens: int, completion_tokens: int) -> f
     return (
         prompt_tokens * prices.get("prompt", 0.0)
         + completion_tokens * prices.get("completion", 0.0)
+        + cache_read_tokens * prices.get("cache_read", 0.0)
+        + cache_creation_tokens * prices.get("cache_creation", 0.0)
     ) / 1_000_000
 
 
@@ -49,17 +60,24 @@ def get_day_usage(user: str, day: str | None = None) -> dict:
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT prompt_tokens, completion_tokens, cost FROM quota_usage "
+            "SELECT prompt_tokens, completion_tokens, cache_read_tokens, "
+            "cache_creation_tokens, cost FROM quota_usage "
             "WHERE user = ? AND day = ?",
             (user, day),
         ).fetchone()
     finally:
         conn.close()
     if row is None:
-        return {"prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0}
+        return {
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "cost": 0.0,
+        }
     return {
         "prompt_tokens": row["prompt_tokens"] or 0,
         "completion_tokens": row["completion_tokens"] or 0,
+        "cache_read_tokens": row["cache_read_tokens"] or 0,
+        "cache_creation_tokens": row["cache_creation_tokens"] or 0,
         "cost": row["cost"] or 0.0,
     }
 
@@ -70,29 +88,46 @@ def record_usage(
     prompt_tokens: int | None,
     completion_tokens: int | None,
     model: str | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
     day: str | None = None,
 ) -> None:
     """Accumulate one request's token usage (and priced cost) into today's row.
 
+    Cache read/create tokens count toward both the priced cost and the
+    token budget, matching the dashboard's canonical total-token convention.
     Never raises: quota accounting must not break the response path.
     """
     prompt_tokens = prompt_tokens or 0
     completion_tokens = completion_tokens or 0
-    if prompt_tokens <= 0 and completion_tokens <= 0:
+    cache_read_tokens = cache_read_tokens or 0
+    cache_creation_tokens = cache_creation_tokens or 0
+    if (
+        prompt_tokens <= 0 and completion_tokens <= 0
+        and cache_read_tokens <= 0 and cache_creation_tokens <= 0
+    ):
         return
     day = day or _utc_day()
-    cost = _cost_of(model, prompt_tokens, completion_tokens)
+    cost = _cost_of(
+        model, prompt_tokens, completion_tokens,
+        cache_read_tokens, cache_creation_tokens,
+    )
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
-            """INSERT INTO quota_usage (user, day, prompt_tokens, completion_tokens, cost)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO quota_usage
+                   (user, day, prompt_tokens, completion_tokens,
+                    cache_read_tokens, cache_creation_tokens, cost)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(user, day) DO UPDATE SET
                    prompt_tokens = quota_usage.prompt_tokens + excluded.prompt_tokens,
                    completion_tokens = quota_usage.completion_tokens + excluded.completion_tokens,
+                   cache_read_tokens = quota_usage.cache_read_tokens + excluded.cache_read_tokens,
+                   cache_creation_tokens = quota_usage.cache_creation_tokens + excluded.cache_creation_tokens,
                    cost = quota_usage.cost + excluded.cost""",
-            (user, day, prompt_tokens, completion_tokens, cost),
+            (user, day, prompt_tokens, completion_tokens,
+             cache_read_tokens, cache_creation_tokens, cost),
         )
         conn.commit()
     except Exception:
@@ -121,13 +156,16 @@ def check(user: str, now: float | None = None) -> tuple[bool, dict | None]:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT prompt_tokens, completion_tokens, cost, minute_bucket, minute_hits "
+            "SELECT prompt_tokens, completion_tokens, cache_read_tokens, "
+            "cache_creation_tokens, cost, minute_bucket, minute_hits "
             "FROM quota_usage WHERE user = ? AND day = ?",
             (user, day),
         ).fetchone()
         usage = {
             "prompt_tokens": (row["prompt_tokens"] if row else 0) or 0,
             "completion_tokens": (row["completion_tokens"] if row else 0) or 0,
+            "cache_read_tokens": (row["cache_read_tokens"] if row else 0) or 0,
+            "cache_creation_tokens": (row["cache_creation_tokens"] if row else 0) or 0,
             "cost": (row["cost"] if row else 0.0) or 0.0,
             "minute_bucket": (row["minute_bucket"] if row else 0) or 0,
             "minute_hits": (row["minute_hits"] if row else 0) or 0,
@@ -147,7 +185,14 @@ def check(user: str, now: float | None = None) -> tuple[bool, dict | None]:
             hits = usage["minute_hits"]
 
         if token_budget > 0:
-            used = usage["prompt_tokens"] + usage["completion_tokens"]
+            # Canonical total: prompt + completion + cache read + cache
+            # creation — the same sum the dashboard reports.
+            used = sum(
+                usage[k] for k in (
+                    "prompt_tokens", "completion_tokens",
+                    "cache_read_tokens", "cache_creation_tokens",
+                )
+            )
             if used >= token_budget:
                 conn.rollback()
                 return False, {

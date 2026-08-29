@@ -1154,8 +1154,10 @@ def _quota_response_headers(user: str) -> dict:
     usage = gateway.quota.get_day_usage(user)
     return {
         "X-Gateway-Daily-Token-Budget": str(budget),
+        # Canonical total: prompt + completion + cache read + cache creation.
         "X-Gateway-Daily-Tokens-Used": str(
             usage["prompt_tokens"] + usage["completion_tokens"]
+            + usage["cache_read_tokens"] + usage["cache_creation_tokens"]
         ),
     }
 
@@ -1175,6 +1177,10 @@ def _record_quota_usage(request: Request) -> None:
         prompt_tokens=getattr(request.state, "prompt_tokens", None),
         completion_tokens=getattr(request.state, "completion_tokens", None),
         model=getattr(request.state, "model", None),
+        cache_read_tokens=getattr(request.state, "cache_read_tokens", None),
+        cache_creation_tokens=getattr(
+            request.state, "cache_creation_tokens", None,
+        ),
     )
 
 

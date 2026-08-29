@@ -148,6 +148,8 @@ def init_audit_db() -> None:
             day               TEXT    NOT NULL,
             prompt_tokens     INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             cost              REAL    NOT NULL DEFAULT 0.0,
             minute_bucket     INTEGER NOT NULL DEFAULT 0,
             minute_hits       INTEGER NOT NULL DEFAULT 0,
@@ -193,6 +195,17 @@ def init_audit_db() -> None:
     ):
         try:
             conn.execute(f"ALTER TABLE audit_logs ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # quota_usage gained cache-token columns with the cost-accounting fix
+    # (improvement 3); pre-existing rows keep their totals (DEFAULT 0).
+    for col in ("cache_read_tokens", "cache_creation_tokens"):
+        try:
+            conn.execute(
+                f"ALTER TABLE quota_usage ADD COLUMN {col} "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
         except sqlite3.OperationalError:
             pass  # column already exists
 
