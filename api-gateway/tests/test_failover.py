@@ -202,6 +202,14 @@ def test_silent_failover_on_upstream_5xx(client, monkeypatch):
     resp = client.post("/v1/chat", json=chat_body())
     assert resp.status_code == 200
     assert resp.headers.get("X-Gateway-Route") == "Backup Route"
+    # The switch itself is observable (improvement 9).
+    import re
+    metrics = client.get("/metrics").text
+    m = re.search(
+        r'gateway_route_failover_total\{route="Backup Route"\}\s+([\d.]+)',
+        metrics,
+    )
+    assert m is not None and float(m.group(1)) >= 1
 
 
 def test_silent_failover_on_connection_error(client, monkeypatch):

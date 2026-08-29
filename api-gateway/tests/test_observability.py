@@ -46,6 +46,17 @@ class _CaptureHandler(logging.Handler):
         self.lines.append(self.format(record))
 
 
+def _series(client, name, **labels):
+    """Value of one label-set from /metrics (0.0 when the series is new)."""
+    text = client.get("/metrics").text
+    for line in text.splitlines():
+        if line.startswith(name + "{") and all(
+            f'{k}="{v}"' in line for k, v in labels.items()
+        ):
+            return float(line.split()[-1])
+    return 0.0
+
+
 class TestJsonLogging:
     """Verify log_request outputs valid JSON lines."""
 
@@ -291,5 +302,80 @@ class TestMetricsEndpoint:
             assert after_val > before_val
         finally:
             config.UPSTREAM_URL = old_upstream
+            import os
+            os.unlink(key_path)
+
+    # --- Extended metrics (improvement 9) ---------------------------------
+
+    def test_new_metric_families_registered(self, client):
+        body = client.get("/metrics").text
+        for fam in (
+            "gateway_upstream_duration_seconds",
+            "gateway_route_failover_total",
+            "gateway_route_cooldown_total",
+            "gateway_tokens_total",
+            "gateway_auth_failures_total",
+        ):
+            assert f"# TYPE {fam}" in body, fam
+
+    def test_auth_failure_counter_missing_token(self, client):
+        before = _series(client, "gateway_auth_failures_total",
+                         reason="missing_token")
+        client.get("/v1/models")
+        after = _series(client, "gateway_auth_failures_total",
+                        reason="missing_token")
+        assert after == before + 1
+
+    def test_auth_failure_counter_invalid_jwt(self, client):
+        before = _series(client, "gateway_auth_failures_total",
+                         reason="invalid_jwt")
+        client.get("/v1/models", headers={"Authorization": "Bearer nope"})
+        after = _series(client, "gateway_auth_failures_total",
+                        reason="invalid_jwt")
+        assert after == before + 1
+
+    def test_cooldown_trip_counter(self, client):
+        """Circuit-breaker trips are observable per route."""
+        import gateway.main as gm
+        before = _series(client, "gateway_route_cooldown_total",
+                         route="svc-metric-test")
+        gm._mark_route_failed(("user-metric", "svc-metric-test"))
+        after = _series(client, "gateway_route_cooldown_total",
+                        route="svc-metric-test")
+        assert after == before + 1
+
+    def test_tokens_total_counter(self, client):
+        """Quota accounting also feeds per-user/model token counters."""
+        from types import SimpleNamespace
+        import gateway.main as gm
+        req = SimpleNamespace(state=SimpleNamespace(
+            quota_user="metric-alice", prompt_tokens=120,
+            completion_tokens=34, model="metric-model",
+            cache_read_tokens=5, cache_creation_tokens=6,
+        ))
+        gm._record_quota_usage(req)
+        assert _series(client, "gateway_tokens_total", user="metric-alice",
+                       model="metric-model", kind="prompt") == 120
+        assert _series(client, "gateway_tokens_total", user="metric-alice",
+                       model="metric-model", kind="completion") == 34
+        assert _series(client, "gateway_tokens_total", user="metric-alice",
+                       model="metric-model", kind="cache_read") == 5
+        assert _series(client, "gateway_tokens_total", user="metric-alice",
+                       model="metric-model", kind="cache_creation") == 6
+
+    def test_upstream_duration_observed(self, client):
+        token, pub = _create_jwt("dur-user")
+        key_path = _set_gateway_key(pub)
+        try:
+            before = _series(client, "gateway_upstream_duration_seconds_count",
+                             route="/get")
+            resp = client.get(
+                "/get", headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            after = _series(client, "gateway_upstream_duration_seconds_count",
+                            route="/get")
+            assert after == before + 1
+        finally:
             import os
             os.unlink(key_path)

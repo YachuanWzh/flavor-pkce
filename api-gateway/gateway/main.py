@@ -40,6 +40,11 @@ from gateway.metrics import (
     REQUEST_DURATION,
     UPSTREAM_ERRORS,
     ACTIVE_CONNECTIONS,
+    AUTH_FAILURES,
+    ROUTE_COOLDOWNS,
+    ROUTE_FAILOVERS,
+    TOKENS_TOTAL,
+    UPSTREAM_DURATION,
     normalize_path,
 )
 
@@ -1276,16 +1281,28 @@ def _record_quota_usage(request: Request) -> None:
     user = getattr(request.state, "quota_user", None)
     if not user:
         return
+    prompt = getattr(request.state, "prompt_tokens", None) or 0
+    completion = getattr(request.state, "completion_tokens", None) or 0
+    cache_read = getattr(request.state, "cache_read_tokens", None) or 0
+    cache_creation = getattr(request.state, "cache_creation_tokens", None) or 0
     gateway.quota.record_usage(
         user,
-        prompt_tokens=getattr(request.state, "prompt_tokens", None),
-        completion_tokens=getattr(request.state, "completion_tokens", None),
+        prompt_tokens=prompt,
+        completion_tokens=completion,
         model=getattr(request.state, "model", None),
-        cache_read_tokens=getattr(request.state, "cache_read_tokens", None),
-        cache_creation_tokens=getattr(
-            request.state, "cache_creation_tokens", None,
-        ),
+        cache_read_tokens=cache_read,
+        cache_creation_tokens=cache_creation,
     )
+    # Prometheus mirror of the same accounting (improvement 9). Label
+    # cardinality is bounded by users x models — fine at this deployment
+    # scale (single admin, <1k req/day).
+    model = getattr(request.state, "model", None) or "-"
+    for kind, value in (
+        ("prompt", prompt), ("completion", completion),
+        ("cache_read", cache_read), ("cache_creation", cache_creation),
+    ):
+        if value > 0:
+            TOKENS_TOTAL.labels(user=user, model=model, kind=kind).inc(value)
 
 
 def _audit_log_request(
@@ -1350,6 +1367,7 @@ async def proxy(request: Request, path: str):
         token = auth_header[7:]
 
     if token is None:
+        AUTH_FAILURES.labels(reason="missing_token").inc()
         return JSONResponse(
             status_code=401,
             content={"error": "Missing or invalid Authorization header"},
@@ -1357,6 +1375,7 @@ async def proxy(request: Request, path: str):
 
     payload = verify_jwt(token)
     if payload is None:
+        AUTH_FAILURES.labels(reason="invalid_jwt").inc()
         return JSONResponse(
             status_code=401,
             content={"error": "Invalid or expired JWT"},
@@ -1365,6 +1384,7 @@ async def proxy(request: Request, path: str):
     # Reject tokens whose jti was revoked at the auth server (P0-3).
     jti = payload.get("jti")
     if jti and await _is_jti_revoked(jti):
+        AUTH_FAILURES.labels(reason="revoked").inc()
         return JSONResponse(
             status_code=401,
             content={"error": "Token has been revoked"},
@@ -1565,6 +1585,9 @@ async def proxy(request: Request, path: str):
 
             # The route handled the request — lift any cooldown on it.
             _route_cooldowns.pop(cooldown_key, None)
+            if index > 0:
+                # The primary failed earlier in this loop: count the switch.
+                ROUTE_FAILOVERS.labels(route=service_name).inc()
 
             content_type = resp.headers.get("content-type", "")
             is_sse = "text/event-stream" in content_type
@@ -1604,6 +1627,9 @@ async def proxy(request: Request, path: str):
                         request.state.upstream_ms = (
                             (time.perf_counter() - upstream_start) * 1000
                         )
+                        UPSTREAM_DURATION.labels(
+                            route=normalize_path(request.url.path),
+                        ).observe(request.state.upstream_ms / 1000)
                         await resp.aclose()
                         await client.aclose()
                         # Usage is final now — write the deferred audit log.
@@ -1633,6 +1659,9 @@ async def proxy(request: Request, path: str):
             request.state.upstream_ms = (
                 (time.perf_counter() - upstream_start) * 1000
             )
+            UPSTREAM_DURATION.labels(
+                route=normalize_path(request.url.path),
+            ).observe(request.state.upstream_ms / 1000)
             _extract_full_token_usage(request, content)
             # Usage is final now — count it toward the daily budget and
             # report the post-request balance to the client.
@@ -1722,6 +1751,7 @@ def _header_safe_route_name(name: str) -> str:
 
 def _mark_route_failed(cooldown_key: tuple[str, str]) -> None:
     """Start the circuit-breaker cooldown for a failed route."""
+    ROUTE_COOLDOWNS.labels(route=cooldown_key[1]).inc()
     seconds = gateway.config.FAILOVER_COOLDOWN_SECONDS
     if seconds > 0:
         now = time.monotonic()

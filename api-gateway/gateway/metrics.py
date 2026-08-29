@@ -32,6 +32,47 @@ UPSTREAM_ERRORS = Counter(
     ["method", "path"],
 )
 
+# ---- Upstream latency (improvement 9) ----
+
+UPSTREAM_DURATION = Histogram(
+    "gateway_upstream_duration_seconds",
+    "Upstream round-trip time (request sent → response fully read).",
+    ["route"],
+    buckets=[
+        0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+    ],
+)
+
+# ---- Routing / failover health ----
+
+ROUTE_FAILOVERS = Counter(
+    "gateway_route_failover_total",
+    "Times a non-primary candidate route served a request after the "
+    "primary failed.",
+    ["route"],
+)
+
+ROUTE_COOLDOWNS = Counter(
+    "gateway_route_cooldown_total",
+    "Circuit-breaker trips: route marked into the cooldown window.",
+    ["route"],
+)
+
+# ---- Usage and security counters ----
+
+TOKENS_TOTAL = Counter(
+    "gateway_tokens_total",
+    "Tokens accounted into the daily quota, by kind. Cardinality is "
+    "bounded by (users x models), suited to the single-admin scale.",
+    ["user", "model", "kind"],
+)
+
+AUTH_FAILURES = Counter(
+    "gateway_auth_failures_total",
+    "Proxy requests refused at the JWT gate, by reason.",
+    ["reason"],
+)
+
 # ---- Connection gauge ----
 
 ACTIVE_CONNECTIONS = Gauge(
