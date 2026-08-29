@@ -12,6 +12,8 @@ buffered body once the stream is drained (Anthropic ``message_start``
 / ``message_delta``; OpenAI final usage chunk).
 """
 
+import base64
+import hashlib
 import json as _json
 import secrets
 import time
@@ -148,12 +150,114 @@ def load_public_key():
     return _public_key
 
 
+# ---------------------------------------------------------------------------
+# JWT keyring (improvement 5): keys resolved by the token's ``kid`` header.
+#
+# The shared public-key file bootstraps the ring; an unknown kid triggers a
+# cooldown-limited fetch of auth-server's /.well-known/jwks.json. Rotating
+# the signing key only requires restarting auth-server — the gateway picks
+# the new key up on the first token that carries the new kid, and pre-
+# rotation keys keep verifying until those tokens expire.
+# ---------------------------------------------------------------------------
+
+_jwt_keyring: dict[str, object] = {}
+_jwks_file_key_id: str | None = None
+_jwks_last_fetch = 0.0
+
+
+def _key_id_for_public(public_key) -> str:
+    """Same derivation as auth_server.jwt_utils.key_id."""
+    der = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(der).hexdigest()[:16]
+
+
+def _install_jwk(kid: str, n: int, e: int) -> None:
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+    _jwt_keyring[kid] = RSAPublicNumbers(e, n).public_key()
+
+
+def _bootstrap_keyring() -> None:
+    """Keep the file-loaded key in the ring (single-entry per file key)."""
+    global _jwks_file_key_id
+    pub = load_public_key()
+    kid = _key_id_for_public(pub)
+    if _jwks_file_key_id != kid:
+        if _jwks_file_key_id is not None:
+            _jwt_keyring.pop(_jwks_file_key_id, None)
+        _jwks_file_key_id = kid
+        _jwt_keyring[kid] = pub
+
+
+def _jwks_url() -> str:
+    url = getattr(gateway.config, "JWT_JWKS_URL", "")
+    if url:
+        return url
+    return (
+        f"{gateway.config.AUTH_SERVER_INTERNAL_URL.rstrip('/')}"
+        "/.well-known/jwks.json"
+    )
+
+
+def _b64u_int(value: str) -> int:
+    raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    return int.from_bytes(raw, "big")
+
+
+def _fetch_jwks_into_keyring() -> None:
+    """Refresh the keyring from auth-server. Silent on failure: verification
+    of an unknown kid then returns None and retries after the cooldown."""
+    try:
+        with httpx.Client(timeout=5.0, trust_env=False) as client:
+            response = client.get(_jwks_url())
+            response.raise_for_status()
+            for key in response.json().get("keys", []):
+                if key.get("kty") != "RSA" or not key.get("kid"):
+                    continue
+                _install_jwk(
+                    str(key["kid"]),
+                    _b64u_int(key["n"]), _b64u_int(key["e"]),
+                )
+    except Exception:
+        pass  # rotation window / auth temporarily down — retry after cooldown
+
+
+def _key_for_kid(kid: str | None):
+    global _jwks_last_fetch
+    _bootstrap_keyring()
+    if kid is None:
+        return load_public_key()  # pre-kid tokens: single file key, as before
+    if kid not in _jwt_keyring:
+        cooldown = getattr(gateway.config, "JWT_JWKS_REFETCH_SECONDS", 60)
+        if time.monotonic() - _jwks_last_fetch >= cooldown:
+            _jwks_last_fetch = time.monotonic()
+            _fetch_jwks_into_keyring()
+    return _jwt_keyring.get(kid)
+
+
 def verify_jwt(token: str) -> dict | None:
     """Verify JWT signature and expiration. Returns payload or None."""
     try:
-        return pyjwt.decode(token, load_public_key(), algorithms=["RS256"])
+        kid = pyjwt.get_unverified_header(token).get("kid")
     except Exception:
         return None
+    key = _key_for_kid(kid)
+    if key is None:
+        return None
+    try:
+        return pyjwt.decode(token, key, algorithms=["RS256"])
+    except Exception:
+        return None
+
+
+def _reset_jwt_keyring_for_tests() -> None:
+    global _public_key, _jwks_file_key_id, _jwks_last_fetch
+    _jwt_keyring.clear()
+    _public_key = None
+    _jwks_file_key_id = None
+    _jwks_last_fetch = 0.0
 
 
 async def _resolve_user_routing(payload: dict) -> tuple[dict | None, JSONResponse | None]:

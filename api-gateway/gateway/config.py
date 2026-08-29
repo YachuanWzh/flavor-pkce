@@ -49,6 +49,13 @@ ROUTING_CACHE_TTL_SECONDS = int(os.environ.get("ROUTING_CACHE_TTL_SECONDS", "0")
 # 0 disables caching (every request checks with the auth server).
 REVOCATION_CACHE_TTL_SECONDS = int(os.environ.get("REVOCATION_CACHE_TTL_SECONDS", "5"))
 
+# JWT key rotation (improvement 5). When a token's ``kid`` is not in the
+# local keyring, the gateway refreshes signing keys from this JWKS URL;
+# empty derives it from AUTH_SERVER_INTERNAL_URL (/.well-known/jwks.json).
+JWT_JWKS_URL = os.environ.get("JWT_JWKS_URL", "")
+# Minimum seconds between two JWKS fetches (throttle against hammering).
+JWT_JWKS_REFETCH_SECONDS = int(os.environ.get("JWT_JWKS_REFETCH_SECONDS", "60"))
+
 # Intelligent routing / failover: after a candidate route fails, skip it for
 # this many seconds (circuit-breaker cooldown). 0 disables cooldowns.
 FAILOVER_COOLDOWN_SECONDS = int(os.environ.get("FAILOVER_COOLDOWN_SECONDS", "30"))
@@ -67,7 +74,8 @@ FAILOVER_REQUIRE_CONSENT = (
 # Per-user quota enforcement on the proxy (0 = limit disabled).
 # Requests per user per fixed one-minute window.
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "0"))
-# prompt+completion tokens per user per UTC day.
+# Total tokens per user per UTC day (prompt + completion + cache read +
+# cache creation — the same canonical total the dashboard reports).
 DAILY_TOKEN_BUDGET = int(os.environ.get("DAILY_TOKEN_BUDGET", "0"))
 # Estimated USD spend per user per UTC day (priced via MODEL_PRICES_JSON).
 DAILY_COST_BUDGET_USD = float(os.environ.get("DAILY_COST_BUDGET_USD", "0"))
