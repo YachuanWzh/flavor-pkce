@@ -3,6 +3,8 @@
 Uses RS256 (RSA with SHA-256) for JWT signing.
 Keys are generated on first run and stored in auth_server/keys/.
 """
+import base64
+import hashlib
 import os
 import uuid
 import json
@@ -54,6 +56,33 @@ def _ensure_keys_exist() -> None:
         ))
 
 
+def key_id(public_key) -> str:
+    """Stable thumbprint of a public key: first 16 hex of SHA-256 over its
+    DER (SubjectPublicKeyInfo) encoding. The gateway derives the same id."""
+    der = public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(der).hexdigest()[:16]
+
+
+def get_jwks() -> dict:
+    """RFC 7517 key set with the current signing key (public material only)."""
+    _ensure_keys_exist()
+    with open(JWT_PUBLIC_KEY_PATH, "rb") as f:
+        pub = serialization.load_pem_public_key(f.read())
+    nums = pub.public_numbers()
+
+    def _b64u(value: int) -> str:
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    return {"keys": [{
+        "kty": "RSA", "use": "sig", "alg": "RS256",
+        "kid": key_id(pub), "n": _b64u(nums.n), "e": _b64u(nums.e),
+    }]}
+
+
 def _load_private_key():
     """Load the RSA private key."""
     _ensure_keys_exist()
@@ -100,7 +129,10 @@ def create_jwt(
         payload["config_version"] = config_version
 
     private_key = _load_private_key()
-    token = pyjwt.encode(payload, private_key, algorithm=JWT_ALGORITHM)
+    token = pyjwt.encode(
+        payload, private_key, algorithm=JWT_ALGORITHM,
+        headers={"kid": key_id(private_key.public_key())},
+    )
     return token
 
 

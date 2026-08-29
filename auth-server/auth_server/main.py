@@ -1358,6 +1358,18 @@ def _build_consent_html(client_name: str, scope: str, username: str) -> str:
     )
 
 
+@app.get("/.well-known/jwks.json")
+async def jwks():
+    """RFC 7517 public key set for JWT verification (rotation support).
+
+    Public material only: the gateway resolves a token's ``kid`` header
+    against this document, so rotating the signing key no longer requires
+    restarting the gateway inside the old token lifetime.
+    """
+    from auth_server.jwt_utils import get_jwks
+    return JSONResponse(get_jwks())
+
+
 # ---------- React SPA Serving ----------
 
 import os
