@@ -167,6 +167,10 @@ async def _resolve_user_routing(payload: dict) -> tuple[dict | None, JSONRespons
             "upstream_api_key": gateway.config.UPSTREAM_API_KEY,
             "upstream_auth_type": gateway.config.UPSTREAM_AUTH_TYPE,
             "models": [],
+            # Marks the gateway-wide env fallback so callers (the data
+            # agent) can turn upstream credential rejections into an
+            # actionable "configure LLM settings" error (improvement 2).
+            "legacy_fallback": True,
         }, None
     key = (user_id, version)
     cached = _routing_cache.get(key)
@@ -516,6 +520,18 @@ def _agent_identity(payload: dict) -> tuple[str, str | None]:
     """Human-readable username + stable user id for agent audit records."""
     user = payload.get("username") or payload.get("sub") or "-"
     return str(user), payload.get("sub")
+
+
+_LLM_CONFIG_HINT = (
+    "llm_config_required: 上游拒绝了当前凭据（该用户未配置个人 LLM，"
+    "网关全局回退凭据无效）。请在「LLM 设置」中配置上游地址与 API Key。"
+)
+
+
+def _legacy_credential_rejected(routing: dict | None, exc: httpx.HTTPStatusError) -> bool:
+    """True when the upstream refused the gateway-wide fallback credentials."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return bool(routing and routing.get("legacy_fallback")) and status in (401, 403)
 
 
 @app.get("/api/agent/queries")
@@ -883,6 +899,10 @@ async def api_agent_ask(request: Request, body: AgentAskRequest):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except httpx.HTTPStatusError as exc:
+        if _legacy_credential_rejected(routing, exc):
+            raise HTTPException(status_code=400, detail=_LLM_CONFIG_HINT)
+        raise HTTPException(status_code=502, detail=f"Upstream LLM error: {exc}")
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Upstream LLM error: {exc}")
 
@@ -913,6 +933,12 @@ async def api_agent_ask_stream(request: Request, body: AgentAskRequest):
             ):
                 yield encode(item["event"], item["data"])
         except httpx.HTTPStatusError as exc:
+            if _legacy_credential_rejected(routing, exc):
+                yield encode("error", {
+                    "message": _LLM_CONFIG_HINT,
+                    "code": "llm_config_required",
+                })
+                return
             status = getattr(exc.response, "status_code", None)
             message = (
                 f"Upstream LLM returned HTTP {status}"
@@ -1011,6 +1037,12 @@ async def api_agent_chat(request: Request, body: AgentChatRequest):
             ):
                 yield _sse_encode(item["event"], item["data"])
         except httpx.HTTPStatusError as exc:
+            if _legacy_credential_rejected(routing, exc):
+                yield _sse_encode("error", {
+                    "message": _LLM_CONFIG_HINT,
+                    "code": "llm_config_required",
+                })
+                return
             status = getattr(exc.response, "status_code", None)
             message = (
                 f"Upstream LLM returned HTTP {status}"
@@ -1053,6 +1085,14 @@ async def api_agent_chat_confirm(request: Request, body: AgentConfirmRequest):
                 user=user, user_id=user_id,
             ):
                 yield _sse_encode(item["event"], item["data"])
+        except httpx.HTTPStatusError as exc:
+            if _legacy_credential_rejected(routing, exc):
+                yield _sse_encode("error", {
+                    "message": _LLM_CONFIG_HINT,
+                    "code": "llm_config_required",
+                })
+                return
+            yield _sse_encode("error", {"message": f"Agent error: {exc}"})
         except httpx.HTTPError as exc:
             yield _sse_encode("error", {"message": f"Agent error: {exc}"})
         except ValueError as exc:
