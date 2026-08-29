@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import * as echarts from "echarts";
+import echarts from "./echarts-lite";
 import AgentChat from "./AgentChat";
+import { buildDashboardCsv } from "./dashboard-csv.js";
 
 const PALETTE = ["#5b8def", "#34d399", "#f87171", "#fbbf24", "#a78bfa", "#22d3ee"];
 const AUTO_REFRESH_MS = 60_000;
@@ -228,6 +229,21 @@ export default function DashboardPage() {
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => { loadAlerts(); }, [loadAlerts]);
+
+  // Export the current window's aggregate tables as one sectioned CSV
+  // (improvement 8). BOM prefix so Excel opens UTF-8 numbers/labels right.
+  const handleExport = useCallback(() => {
+    if (!data) return;
+    const csv = buildDashboardCsv(data);
+    if (!csv) return;
+    const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `dashboard-${startDate || "all"}-${endDate || "all"}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [data, startDate, endDate]);
 
   // Auto-refresh keeps this an observability page rather than a snapshot.
   useEffect(() => {
@@ -474,6 +490,9 @@ export default function DashboardPage() {
           <div className="dashboard-toolbar">
             <span className="muted">{periodLabel} · auto-refresh {AUTO_REFRESH_MS / 1000}s{lastRefresh ? ` · updated ${lastRefresh}` : ""}</span>
             <span className="muted">Click a bar in Requests & errors to drill into that day's audit log</span>
+            <button className="btn-mini" onClick={handleExport} disabled={!data}>
+              Export CSV
+            </button>
           </div>
 
           <div className="dashboard-grid">

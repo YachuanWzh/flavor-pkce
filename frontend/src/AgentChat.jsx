@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import * as echarts from "echarts";
+import echarts from "./echarts-lite";
 
 /* Shared data-agent chat: session loop, real SSE streaming, human SQL
  * confirmation. Used full-page by /agent and as a floating panel on
