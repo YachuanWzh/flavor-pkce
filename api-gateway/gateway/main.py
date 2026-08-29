@@ -215,7 +215,12 @@ def _fetch_jwks_into_keyring() -> None:
     """Refresh the keyring from auth-server. Silent on failure: verification
     of an unknown kid then returns None and retries after the cooldown."""
     try:
-        with httpx.Client(timeout=5.0, trust_env=False) as client:
+        # Sync fetch: verify_jwt also runs inside the event loop (async
+        # proxy). The short timeout caps the worst-case stall to ~2s per
+        # JWT_JWKS_REFETCH_SECONDS window — acceptable at single-machine
+        # (<1k req/day) scale, where the alternative (async refactor of
+        # every verify call site) is not.
+        with httpx.Client(timeout=2.0, trust_env=False) as client:
             response = client.get(_jwks_url())
             response.raise_for_status()
             for key in response.json().get("keys", []):

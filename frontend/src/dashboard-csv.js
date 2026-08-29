@@ -3,7 +3,11 @@
 
 function escapeCell(value) {
   if (value === null || value === undefined) return "";
-  const s = String(value);
+  let s = String(value);
+  // Formula-injection guard (review): model / service / user names are
+  // operator-influenced, and Excel executes cells starting with these
+  // characters. A leading apostrophe makes Excel treat the cell as text.
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

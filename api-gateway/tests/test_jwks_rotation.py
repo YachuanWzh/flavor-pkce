@@ -87,6 +87,51 @@ def test_wrong_signature_for_known_kid_returns_none(keyring_env, monkeypatch):
     assert gm.verify_jwt(_token(evil, kid1)) is None
 
 
+def test_jwks_document_parsing_end_to_end(keyring_env, monkeypatch):
+    """The real _fetch_jwks_into_keyring parses an auth-shaped JWKS document
+    (base64url n/e, junk entries filtered) and installs a working key."""
+    import base64
+
+    key4 = _pair()
+    kid4 = gm._key_id_for_public(key4.public_key())
+    nums = key4.public_key().public_numbers()
+
+    def b64u(value):
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    document = {"keys": [
+        {"kty": "EC", "kid": "skip-me"},  # wrong type
+        {"kty": "RSA", "n": b64u(nums.n), "e": b64u(nums.e)},  # kidless
+        {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": kid4,
+         "n": b64u(nums.n), "e": b64u(nums.e)},
+    ]}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return document
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url):
+            assert url.endswith("/.well-known/jwks.json")
+            return FakeResponse()
+
+    monkeypatch.setattr(gm.httpx, "Client", FakeClient)
+    assert gm.verify_jwt(_token(key4, kid4))["sub"] == "u"
+
+
 def test_rotation_end_to_end(keyring_env, monkeypatch):
     """The full rotation story: auth restarts with a fresh key, the gateway
     picks it up from JWKS without restarting."""
