@@ -93,6 +93,8 @@ cd frontend && npm install && npm run dev   # http://localhost:5174
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | 管理员初始账号(生产首次启动后建议修改) |
 | `UPSTREAM_URL` / `UPSTREAM_API_KEY` | 默认 LLM 上游地址与真实 API Key(仅存于服务端) |
 | `UPSTREAM_URL_ALLOWLIST` | SSRF 白名单(逗号分隔),放行内网/特殊 DNS 环境 |
+| `JWT_JWKS_URL` / `JWT_JWKS_REFETCH_SECONDS` | 网关 JWKS 拉取地址与节流(留空自动从 `AUTH_SERVER_INTERNAL_URL` 推导) |
+| `RATE_LIMIT_RPM` / `DAILY_TOKEN_BUDGET` / `DAILY_COST_BUDGET_USD` | 每用户配额;token 预算口径与仪表盘一致(prompt+completion+cache_read+cache_creation) |
 | `COOKIE_SECURE` / `ENABLE_HSTS` | 生产设 `true`(生产 compose 已默认开启) |
 
 ## 测试
@@ -107,6 +109,10 @@ cd api-gateway && pip install -e ".[dev]" && pytest
 # 前端
 cd frontend && npm install && npm run lint && npm run build
 ```
+
+NL2SQL Agent 的离线回归(`tests/test_agent_golden.py`)随网关 pytest 运行;
+对真实上游的手动评测脚本与用例格式见
+[`docs/ops/agent-eval.md`](docs/ops/agent-eval.md)。
 
 ## 生产部署
 
@@ -129,6 +135,13 @@ docker compose -f deploy/docker-compose.prod.yml --env-file .env.prod up -d --bu
 - **审计链路**:`/api/logs*`、`/api/stats*`、`/api/query`、`/api/agent/ask` 无 Token 一律 401;管理员 JWT(SSO)可访问 `/gw/audit`、`/gw/report` 以及前端 `/dashboard`、`/agent`(经 `/gw/*` 前缀访问网关 API)
 - **SSRF**:出站请求校验目标地址,仅公网 http(s),私网/元数据被拒
 - **撤销**:网关每次请求校验 jti,刷新令牌轮换,登出即撤销
+- **密钥轮换**:JWT 头带 `kid`,auth-server 公开 `/.well-known/jwks.json`;网关按 kid
+  选钥、遇未知 kid 节流拉取 JWKS——换钥后无需重启网关,无 kid 的旧令牌仍回退本地公钥
+- **可观测**:`/metrics` 暴露请求量/时延之外,还有上游时延直方图
+  (`gateway_upstream_duration_seconds`)、failover/熔断计数
+  (`gateway_route_failover_total` / `gateway_route_cooldown_total`)、
+  按用户/模型的 token 计数(`gateway_tokens_total`)与认证失败计数
+  (`gateway_auth_failures_total`)
 
 ## 安全提醒(提交前必读)
 

@@ -81,6 +81,9 @@ services:
       - keys-volume:/app/keys:ro
       - audit-db-volume:/app/data
     environment:
+      # 密钥轮换:令牌带 kid,网关按 kid 选钥;遇到未知 kid 会从
+      # AUTH_SERVER_INTERNAL_URL 推导的 /.well-known/jwks.json 节流刷新,
+      # 换钥后 auth-server 重启即可,网关无需重启。JWT_JWKS_URL 可显式覆盖。
       - JWT_PUBLIC_KEY_PATH=/app/keys/public.pem
       - UPSTREAM_URL=${UPSTREAM_URL:?set UPSTREAM_URL (default LLM upstream)}
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:?set UPSTREAM_API_KEY}
