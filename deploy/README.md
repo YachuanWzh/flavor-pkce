@@ -46,6 +46,10 @@ docker compose -f deploy/docker-compose.prod.yml logs -f
 
 - 命名卷：`keys-volume`（JWT 私钥/Fernet 密钥，**首次启动自动生成**）、
   `auth-db-volume`、`audit-db-volume`
+- JWT 密钥轮换：删除/替换 `keys-volume` 中的 `private.pem` 后重启 auth-server，
+  新公钥经 `/.well-known/jwks.json` 发布；网关按令牌 kid 验钥、遇未知 kid 节流
+  拉取 JWKS，**无需重启网关**。网关仍需挂载 `keys-volume`（只读）用于 keyring
+  引导与无 kid 旧令牌回退。
 - 备份请使用 `scripts/backup.py`（在线快照，无需停服）：
   ```bash
   docker compose -f deploy/docker-compose.prod.yml exec auth-server \
